@@ -61,8 +61,82 @@ def _select_realization(ds, realization: int):
     return ds
 
 
-def load_national_weather(path, realization: int = 0) -> tuple[pd.Series, dict[int, float]]:
-    """→ (national daily-mean temperature °C, wetness_by_year = annual precip / mean annual precip)."""
+def zone_map(path) -> dict[str, list[str]]:
+    """{zone: [station_id, ...]} from the cube's `zone` coordinate, or {} on a France-only cube.
+
+    Cubes generated before the neighbour extension carry no `zone` coord; callers must degrade rather than
+    fail, because the France-only cube stays valid for every FR-only consumer (steps iii and iv)."""
+    ds = open_cube(path)
+    try:
+        if "zone" not in ds.coords:
+            return {}
+        z = [str(v) for v in ds["zone"].values]
+        st = [str(v) for v in ds["obs"]["station"].values]
+    finally:
+        ds.close()
+    out: dict[str, list[str]] = {}
+    for zz, ss in zip(z, st):
+        out.setdefault(zz, []).append(ss)
+    return out
+
+
+def load_zone_weather(path, variables: list[str], realization: int = 0) -> dict:
+    """{zone: DataFrame[timestamp_utc, <variables>]} — each zone's own station-mean hourly weather.
+
+    This is what replaces "regress every neighbour on FRENCH temperature". A zone's demand response and
+    its renewable output are driven by ITS weather; the cross-border correlation that matters is then
+    whatever the weathergen copula produced between the stations, rather than a correlation of 1 imposed
+    by construction."""
+    import numpy as np
+    import pandas as pd
+
+    ds = _select_realization(open_cube(path), realization)
+    try:
+        da = ds["obs"]
+        time = pd.to_datetime(da["time"].values)
+        if time.tz is None:
+            time = time.tz_localize("UTC")
+        vmap = {str(v): i for i, v in enumerate(da["variable"].values)}
+        stations = [str(v) for v in da["station"].values]
+        zones = [str(v) for v in ds["zone"].values] if "zone" in ds.coords else ["FR"] * len(stations)
+        arr = da.transpose("time", "station", "variable").values
+    finally:
+        ds.close()
+
+    idx: dict[str, list[int]] = {}
+    for i, z in enumerate(zones):
+        idx.setdefault(z, []).append(i)
+    out = {}
+    for z, cols in idx.items():
+        d = {}
+        for v in variables:
+            if v in vmap:
+                d[v] = np.nanmean(arr[:, cols, vmap[v]], axis=1)
+        if d:
+            out[z] = pd.DataFrame(d, index=time).rename_axis("timestamp_utc")
+    return out
+
+
+def _zone_cols(ds, zone: str | None) -> list[int] | None:
+    """Station indices belonging to `zone`, or None to keep every station.
+
+    THE CUBE IS NO LONGER FRANCE-ONLY. Every reduction below used to average all stations because all
+    stations were French; with the neighbour extension that silently turns "France's national temperature"
+    into a European one — Madrid at 15.9 °C and Warsaw at 8.8 °C averaged into a 13.2 °C country. Callers
+    that mean FRANCE must say so, and on a France-only cube (no `zone` coord) this is a no-op, so the
+    pre-extension behaviour is preserved exactly."""
+    if zone is None or "zone" not in ds.coords:
+        return None
+    z = [str(v) for v in ds["zone"].values]
+    cols = [i for i, zz in enumerate(z) if zz == zone]
+    return cols or None
+
+
+def load_national_weather(path, realization: int = 0, zone: str | None = "FR") -> tuple[pd.Series, dict[int, float]]:
+    """→ (national daily-mean temperature °C, wetness_by_year = annual precip / mean annual precip).
+
+    `zone` defaults to FR: this feeds French nuclear thermal derating and French reservoir wetness, and
+    must not be a European average. Pass `zone=None` for a whole-cube mean."""
     ds = _select_realization(open_cube(path), realization)
     try:
         da = ds["obs"]
@@ -71,8 +145,10 @@ def load_national_weather(path, realization: int = 0) -> tuple[pd.Series, dict[i
             time = time.tz_localize("UTC")
         vmap = {str(v): i for i, v in enumerate(da["variable"].values)}
         arr = da.transpose("time", "station", "variable").values
-        temp = np.nanmean(arr[:, :, vmap["temperature_c"]], axis=1)
-        precip = np.nanmean(arr[:, :, vmap["precip_1h_mm"]], axis=1)
+        _c = _zone_cols(ds, zone)
+        _sel = slice(None) if _c is None else _c
+        temp = np.nanmean(arr[:, _sel, vmap["temperature_c"]], axis=1)
+        precip = np.nanmean(arr[:, _sel, vmap["precip_1h_mm"]], axis=1)
     finally:
         ds.close()
     temp_daily = pd.Series(temp, index=time).resample("1D").mean()
@@ -82,8 +158,14 @@ def load_national_weather(path, realization: int = 0) -> tuple[pd.Series, dict[i
     return temp_daily, wetness
 
 
-def load_station_tidy(path, variables, realization: int = 0) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """→ (tidy [timestamp_utc, station_id, <variables>], stations metadata) — demand/res side."""
+def load_station_tidy(path, variables, realization: int = 0,
+                      zone: str | None = "FR") -> tuple[pd.DataFrame, pd.DataFrame]:
+    """→ (tidy [timestamp_utc, station_id, <variables>], stations metadata) — demand/res side.
+
+    `zone` defaults to FR because both consumers are French: `res_model` builds NATIONAL PV and wind from
+    these stations and `demand_model` builds French temperature features. Left unfiltered on the extended
+    cube they would compute France from 76 European stations. A France-only cube has no `zone` coord, so
+    this is a no-op there and the pre-extension behaviour is exact."""
     ds = _select_realization(open_cube(path), realization)
     try:
         da = ds["obs"]
@@ -91,12 +173,14 @@ def load_station_tidy(path, variables, realization: int = 0) -> tuple[pd.DataFra
         if time.tz is None:
             time = time.tz_localize("UTC")
         var_names = [str(v) for v in da["variable"].values]
-        stn = [str(s) for s in da["station"].values]
-        arr = da.transpose("time", "station", "variable").values
+        _c = _zone_cols(ds, zone)
+        keep = list(range(len(da["station"].values))) if _c is None else _c
+        stn = [str(s) for s in da["station"].values[keep]]
+        arr = da.transpose("time", "station", "variable").values[:, keep, :]
         stations = pd.DataFrame({"station_id": stn,
-                                 "latitude": np.asarray(ds["latitude"].values, float),
-                                 "longitude": np.asarray(ds["longitude"].values, float),
-                                 "altitude": np.asarray(ds["elevation"].values, float)})
+                                 "latitude": np.asarray(ds["latitude"].values, float)[keep],
+                                 "longitude": np.asarray(ds["longitude"].values, float)[keep],
+                                 "altitude": np.asarray(ds["elevation"].values, float)[keep]})
     finally:
         ds.close()
     vmap = {v: i for i, v in enumerate(var_names)}

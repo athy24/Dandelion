@@ -66,6 +66,7 @@ def fit_model(config: Config) -> FittedModel:
     trd = trend.fit(config.section("trend"), config.variables)
     _p.update(note="trend")
     _p.close()
+    _export_zone_history(config, ingest.cube)
 
     model = FittedModel(
         config_raw=config.raw, station_meta=station_meta,
@@ -76,6 +77,48 @@ def fit_model(config: Config) -> FittedModel:
     )
     return model
 
+
+
+def _export_zone_history(config: Config, cube) -> None:
+    """Persist each zone's OBSERVED hourly weather (station mean) to `output/zone_hist.parquet`.
+
+    The fitted generator is the forward model; this is its historical counterpart, and the downstream
+    neighbour models need BOTH. A zone's load-vs-temperature regression is estimated on observed load
+    against observed weather, so without this the dispatch has no per-zone historical temperature to
+    regress against and has to fall back on French temperature for every zone — the very substitution the
+    neighbour extension exists to remove.
+
+    Written as a tidy frame rather than a cube: it is read once per fit-year by `weather_shapes`, and a
+    parquet keeps that free of xarray/netCDF handling."""
+    import numpy as np
+    import pandas as pd
+    if "zone" not in cube.coords:
+        return
+    var = [str(v) for v in cube["variable"].values]
+    keep = [v for v in ("temperature_c", "wind_speed_ms", "wind_speed_100m_ms",
+                        "cloud_cover_pct", "precip_1h_mm") if v in var]
+    if not keep:
+        return
+    zones = [str(z) for z in cube["zone"].values]
+    arr = cube.transpose("time", "station", "variable").values
+    vmap = {v: i for i, v in enumerate(var)}
+    idx: dict[str, list[int]] = {}
+    for i, z in enumerate(zones):
+        idx.setdefault(z, []).append(i)
+    time = pd.to_datetime(cube["time"].values)
+    frames = []
+    for z, cols in idx.items():
+        d = {v: np.nanmean(arr[:, cols, vmap[v]], axis=1) for v in keep}
+        f = pd.DataFrame(d)
+        f.insert(0, "zone", z)
+        f.insert(0, "timestamp_utc", time)
+        frames.append(f)
+    out = config.models_dir.parent / "output"
+    out.mkdir(parents=True, exist_ok=True)
+    df = pd.concat(frames, ignore_index=True)
+    df.to_parquet(out / "zone_hist.parquet", index=False)
+    print(f"[fit] zone history -> {out / 'zone_hist.parquet'} "
+          f"({df.zone.nunique()} zones x {len(time):,} h, vars {keep})", flush=True)
 
 def cmd_fit(args: argparse.Namespace) -> None:
     config = load_config(args.config)

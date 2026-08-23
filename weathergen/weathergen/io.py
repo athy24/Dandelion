@@ -82,6 +82,21 @@ def _load_from_sqlite(config: Config) -> tuple[xr.DataArray, pd.DataFrame]:
         if ids:
             m = m[m.station_id.isin(ids)]
         m = m.sort_values("station_id").reset_index(drop=True)
+        m["zone"] = "FR"
+        # Non-French points declared in config (`data.neighbour_stations`). They are NOT in dim_station and
+        # have no observations, so every column below stays NaN and the ERA5 fusion supplies the whole
+        # record — `_bias_correct_monthly` degrades to the identity for a station it has never seen, and
+        # `infill_long_gaps` fills the rest. Fitting them in the SAME copula as the French stations is the
+        # point: the cross-border correlation of temperature and wind then comes out of the dependence
+        # model instead of being imposed downstream by regressing every zone on French temperature.
+        nb = d.get("neighbour_stations") or []
+        if nb:
+            extra = pd.DataFrame([{"station_id": str(r["id"]), "name": str(r.get("name", r["id"])),
+                                   "latitude": float(r["lat"]), "longitude": float(r["lon"]),
+                                   "elevation": float(r.get("elev", 0.0)),
+                                   "region": str(r.get("zone", "")), "zone": str(r["zone"])}
+                                  for r in nb])
+            m = pd.concat([m, extra], ignore_index=True)
         m["lst_offset_h"] = m["longitude"] / 15.0
 
         var_names = config.var_names
@@ -121,6 +136,8 @@ def _empty_cube(time: np.ndarray, meta: pd.DataFrame, var_names: list[str]) -> x
             "longitude": ("station", meta.longitude.to_numpy()),
             "elevation": ("station", meta.elevation.to_numpy()),
             "lst_offset_h": ("station", meta.lst_offset_h.to_numpy()),
+            # market zone per station: what lets the dispatch reduce the cube per bidding zone
+            **({"zone": ("station", meta.zone.to_numpy())} if "zone" in meta.columns else {}),
         },
         name="obs", attrs={"tz": "UTC"},
     )

@@ -51,6 +51,49 @@ def _temp_anomaly(temp: np.ndarray, index: pd.DatetimeIndex, seas: np.ndarray) -
     return temp - _doy_design(index) @ seas
 
 
+
+def _haversine_km(lat, lon):
+    """Pairwise great-circle distance (km) for station coordinate vectors."""
+    la = np.radians(np.asarray(lat, float)); lo = np.radians(np.asarray(lon, float))
+    dla = la[:, None] - la[None, :]
+    dlo = lo[:, None] - lo[None, :]
+    h = np.sin(dla / 2) ** 2 + np.cos(la)[:, None] * np.cos(la)[None, :] * np.sin(dlo / 2) ** 2
+    return 2 * 6371.0 * np.arcsin(np.sqrt(np.clip(h, 0, 1)))
+
+
+def _extend_residual_corr(fitted_chol, known_idx, fitted_pos, lat, lon):
+    """Residual correlation over ALL stations: fitted block kept exactly, the rest exp(-d/L).
+
+    The 100 m residual is a SPATIAL field. Giving unfitted stations an INDEPENDENT residual — the obvious
+    first fallback — destroys precisely the cross-border correlation the neighbour extension exists to
+    create: measured, it collapsed simulated FR-BE 100 m wind correlation from the 10 m field's 0.57 to
+    0.21, and BE-NL from 0.84 to 0.29, because the residual variance swamps the correlated transfer.
+
+    So the unknown block is filled by an exponential decay whose length scale L is FITTED from the known
+    block's own correlation-vs-distance, and the known-known sub-matrix is preserved unchanged. A nugget
+    keeps the result positive-definite for the Cholesky."""
+    S = len(lat)
+    d = _haversine_km(lat, lon)
+    C = np.exp(-d / 500.0)                                  # provisional; L re-fitted just below
+    if len(known_idx) > 2:
+        R = fitted_chol @ fitted_chol.T
+        kk = np.ix_(known_idx, known_idx)
+        dk = d[kk][np.triu_indices(len(known_idx), 1)]
+        rk = np.clip(R[np.ix_(fitted_pos, fitted_pos)][np.triu_indices(len(known_idx), 1)], 1e-6, 1.0)
+        ok = (dk > 1.0) & (rk > 1e-3)
+        if ok.sum() > 10:                                   # log r = -d / L  ->  least squares on the slope
+            L = float(-dk[ok].sum() / np.log(rk[ok]).sum()) if np.log(rk[ok]).sum() < 0 else 500.0
+            L = float(np.clip(L, 100.0, 3000.0))
+            C = np.exp(-d / L)
+        C[kk] = R[np.ix_(fitted_pos, fitted_pos)]           # keep the fitted structure exactly
+    np.fill_diagonal(C, 1.0)
+    C = 0.5 * (C + C.T)
+    w, V = np.linalg.eigh(C)                                # project to the nearest PSD matrix
+    C = (V * np.clip(w, 1e-8, None)) @ V.T
+    dg = np.sqrt(np.clip(np.diag(C), 1e-12, None))
+    C = C / dg[:, None] / dg[None, :]
+    return np.linalg.cholesky(C + 1e-9 * np.eye(S))
+
 @dataclass
 class Wind100Model:
     station_ids: list[str]
@@ -70,11 +113,40 @@ class Wind100Model:
             return cube
         w10 = cube.sel(variable="wind_speed_ms").transpose("time", "station")
         order = [str(s) for s in w10["station"].values]
-        if any(s not in self.station_ids for s in order):               # station set ≠ fitted model
-            return cube                                                 # (e.g. synthetic smoke test) → skip
-        pos = [self.station_ids.index(s) for s in order]                # align model → cube order
-        a, b, phi, sigma = self.a[pos], self.b[pos], self.phi[pos], self.sigma[pos]
-        L = self.chol[np.ix_(pos, pos)]
+        known = [s in self.station_ids for s in order]
+        if not any(known):                                              # nothing fitted at all (smoke test)
+            return cube
+        # PER-STATION DEGRADATION, not all-or-nothing. The neighbour extension adds stations this model was
+        # never fitted on, and the previous behaviour — skip the whole variable if ANY station is unknown —
+        # silently dropped `wind_speed_100m_ms` from the cube entirely, which step iv rejects outright.
+        #
+        # An unknown station takes the MEDIAN fitted transfer (a, b) and an INDEPENDENT residual. That is an
+        # approximation with a known direction: shear is terrain-dependent, so a French-median exponent
+        # applied to a North Sea coastal site slightly OVERSTATES the 100 m / 10 m ratio (smoother surface,
+        # lower shear) and understates it over rough inland terrain. It is bounded, though: the 10 m field
+        # itself is simulated per station by the copula, so the spatial and temporal structure of the wind
+        # is real; only the height extrapolation is generic. Downstream users that FIT a response on this
+        # same variable absorb the level bias into their own coefficient.
+        _pos = [self.station_ids.index(s) if k else -1 for s, k in zip(order, known)]
+        def _take(arr, med):
+            arr = np.asarray(arr)
+            return np.array([arr[i] if i >= 0 else med for i in _pos])
+        a = _take(self.a, float(np.median(self.a)))
+        b = _take(self.b, float(np.median(self.b)))
+        phi = _take(self.phi, float(np.median(self.phi)))
+        sigma = _take(self.sigma, float(np.median(self.sigma)))
+        kn = [i for i, k in enumerate(known) if k]
+        kp = [self.station_ids.index(order[i]) for i in kn]
+        if all(known):
+            L = self.chol[np.ix_(kp, kp)]                               # every station fitted: exact
+        elif "latitude" in cube.coords and "longitude" in cube.coords:
+            L = _extend_residual_corr(self.chol, kn, kp,
+                                      cube["latitude"].sel(station=w10["station"]).values,
+                                      cube["longitude"].sel(station=w10["station"]).values)
+        else:
+            # no geometry to extend with (synthetic cubes): fitted block, unknowns independent
+            L = np.eye(len(order))
+            L[np.ix_(kn, kn)] = self.chol[np.ix_(kp, kp)]
 
         n, S = w10.shape
         mean = a[None, :] + b[None, :] * np.log(np.clip(w10.values, 0, None) + _EPS)
@@ -83,11 +155,14 @@ class Wind100Model:
         # climatology, so it captures the *within-winter* mild-and-windy coupling (not the cross-seasonal sign).
         if self.c is not None and "temperature_c" in set(map(str, cube["variable"].values)):
             temp = cube.sel(variable="temperature_c").transpose("time", "station").sel(station=w10["station"]).values
-            seas = np.asarray(self.temp_seas)[pos]                        # (S, K) climatology coeffs
+            _seas = np.asarray(self.temp_seas)
+            _med_seas = np.median(_seas, axis=0)
+            seas = np.array([_seas[i] if i >= 0 else _med_seas for i in _pos])   # (S, K)
             clim = _doy_design(pd.DatetimeIndex(w10["time"].values)) @ seas.T    # (n, S)
-            astd = np.where(np.asarray(self.temp_astd)[pos] == 0, 1.0, np.asarray(self.temp_astd)[pos])
+            _astd = _take(self.temp_astd, float(np.median(self.temp_astd)))
+            astd = np.where(_astd == 0, 1.0, _astd)
             temp_anom = (temp - clim) / astd[None, :]
-            mean = mean + np.asarray(self.c)[pos][None, :] * temp_anom
+            mean = mean + _take(self.c, float(np.median(self.c)))[None, :] * temp_anom
         # spatially-correlated AR(1) residual field (stationary std = sigma)
         innov = (rng.standard_normal((n, S)) @ L.T) * (sigma * np.sqrt(1.0 - phi ** 2))[None, :]
         resid = np.empty_like(innov)

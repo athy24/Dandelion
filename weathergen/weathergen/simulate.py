@@ -35,7 +35,10 @@ def simulate(model: FittedModel, config: Config, rng: np.random.Generator) -> xr
     g = model.climatology.reconstruct(anom)
     cube = model.transforms.inverse(g)
     # carry station metadata coords
-    for c in ("latitude", "longitude", "elevation", "lst_offset_h"):
+    # `zone` rides along with the geographic coords: it is what lets a consumer reduce the simulated cube
+    # per market zone. Without it the neighbour extension is invisible downstream — the stations are there
+    # but nothing knows which bidding zone each belongs to.
+    for c in ("latitude", "longitude", "elevation", "lst_offset_h", "zone"):
         if c in model.station_meta.columns:
             cube = cube.assign_coords({c: ("station", model.station_meta.set_index("station_id").loc[
                 list(map(str, cube["station"].values)), c].to_numpy())})

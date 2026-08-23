@@ -19,6 +19,54 @@ data:
     bbox: { lat_min: 41.0, lat_max: 52.0, lon_min: -6.0, lon_max: 10.0 }
     ids: []                      # vide => toutes celles dans la bbox
   period: { start: "2014-12-15", end: "2026-01-31" }
+  # --- Points VOISINS (hors France) -----------------------------------------------------------------
+  # Le générateur n'a jamais couvert que la France : 42 stations Météo-France, et le dispatch en déduisait
+  # la météo de CHAQUE zone voisine par régression sur la température FRANÇAISE. Une vague de froid
+  # danoise n'existait donc que si la France en avait une à la même heure, ce qui surestime la simultanéité
+  # des pointes européennes — précisément le biais qui compte pour l'adéquation et les imports.
+  #
+  # Ces points n'ont AUCUNE observation station : ils sont 100 % ERA5. La chaîne le supporte déjà sans
+  # modification — `_bias_correct_monthly` retombe sur les statistiques d'ERA5 pour les mois jamais
+  # observés, donc la correction devient l'identité, et `infill_long_gaps` remplit tout le reste.
+  #
+  # Choix des points : barycentres de charge (température → demande) plus des sites éoliens/solaires
+  # représentatifs (vent 100 m et nébulosité → EnR). Le nombre par zone suit la taille et la diversité
+  # climatique de la zone, pas sa seule superficie.
+  neighbour_stations:
+    - { id: NB_DE_HAM, name: "Hamburg",      zone: DE_LU,    lat: 53.63, lon:  9.99, elev:  16 }
+    - { id: NB_DE_BER, name: "Berlin",       zone: DE_LU,    lat: 52.47, lon: 13.40, elev:  46 }
+    - { id: NB_DE_KOL, name: "Koeln",        zone: DE_LU,    lat: 50.87, lon:  7.16, elev:  92 }
+    - { id: NB_DE_MUC, name: "Muenchen",     zone: DE_LU,    lat: 48.35, lon: 11.79, elev: 447 }
+    - { id: NB_DE_BRE, name: "Bremen",       zone: DE_LU,    lat: 53.05, lon:  8.79, elev:   4 }
+    - { id: NB_BE_BRU, name: "Bruxelles",    zone: BE,       lat: 50.90, lon:  4.48, elev:  56 }
+    - { id: NB_BE_OST, name: "Oostende",     zone: BE,       lat: 51.20, lon:  2.87, elev:   5 }
+    - { id: NB_NL_AMS, name: "Amsterdam",    zone: NL,       lat: 52.31, lon:  4.76, elev:  -4 }
+    - { id: NB_NL_GRQ, name: "Groningen",    zone: NL,       lat: 53.13, lon:  6.58, elev:   4 }
+    - { id: NB_NL_RTM, name: "Rotterdam",    zone: NL,       lat: 51.96, lon:  4.44, elev:  -4 }
+    - { id: NB_GB_LON, name: "London",       zone: GB,       lat: 51.48, lon: -0.45, elev:  25 }
+    - { id: NB_GB_MAN, name: "Manchester",   zone: GB,       lat: 53.35, lon: -2.28, elev:  69 }
+    - { id: NB_GB_GLA, name: "Glasgow",      zone: GB,       lat: 55.87, lon: -4.43, elev:   8 }
+    - { id: NB_GB_CWL, name: "Cardiff",      zone: GB,       lat: 51.40, lon: -3.34, elev:  67 }
+    - { id: NB_CH_ZRH, name: "Zuerich",      zone: CH,       lat: 47.46, lon:  8.55, elev: 432 }
+    - { id: NB_CH_GVA, name: "Geneve",       zone: CH,       lat: 46.24, lon:  6.11, elev: 430 }
+    - { id: NB_IT_MIL, name: "Milano",       zone: IT_NORTH, lat: 45.63, lon:  8.72, elev: 211 }
+    - { id: NB_IT_VCE, name: "Venezia",      zone: IT_NORTH, lat: 45.50, lon: 12.35, elev:   2 }
+    - { id: NB_IT_TRN, name: "Torino",       zone: IT_NORTH, lat: 45.20, lon:  7.65, elev: 301 }
+    - { id: NB_ES_MAD, name: "Madrid",       zone: ES,       lat: 40.47, lon: -3.56, elev: 609 }
+    - { id: NB_ES_BCN, name: "Barcelona",    zone: ES,       lat: 41.30, lon:  2.08, elev:   4 }
+    - { id: NB_ES_SVQ, name: "Sevilla",      zone: ES,       lat: 37.42, lon: -5.90, elev:  34 }
+    - { id: NB_ES_ZAZ, name: "Zaragoza",     zone: ES,       lat: 41.66, lon: -1.00, elev: 263 }
+    - { id: NB_ES_LCG, name: "A Coruna",     zone: ES,       lat: 43.30, lon: -8.38, elev: 100 }
+    - { id: NB_PT_LIS, name: "Lisboa",       zone: PT,       lat: 38.77, lon: -9.13, elev: 114 }
+    - { id: NB_PT_OPO, name: "Porto",        zone: PT,       lat: 41.24, lon: -8.68, elev:  69 }
+    - { id: NB_DK_CPH, name: "Koebenhavn",   zone: DK,       lat: 55.62, lon: 12.66, elev:   5 }
+    - { id: NB_DK_ESB, name: "Esbjerg",      zone: DK,       lat: 55.53, lon:  8.55, elev:   3 }
+    - { id: NB_PL_WAW, name: "Warszawa",     zone: PL_CZ,    lat: 52.17, lon: 20.97, elev: 110 }
+    - { id: NB_PL_KRK, name: "Krakow",       zone: PL_CZ,    lat: 50.08, lon: 19.80, elev: 237 }
+    - { id: NB_CZ_PRG, name: "Praha",        zone: PL_CZ,    lat: 50.10, lon: 14.26, elev: 380 }
+    - { id: NB_PL_GDN, name: "Gdansk",       zone: PL_CZ,    lat: 54.38, lon: 18.47, elev: 149 }
+    - { id: NB_AT_VIE, name: "Wien",         zone: AT_SI,    lat: 48.11, lon: 16.57, elev: 183 }
+    - { id: NB_SI_LJU, name: "Ljubljana",    zone: AT_SI,    lat: 46.22, lon: 14.46, elev: 385 }
   # Fusion ERA5 (station = vérité, ERA5 = extension tails/saisonnalité). Actif dès la Phase 1.
   era5:
     enabled: true
