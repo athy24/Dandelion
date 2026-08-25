@@ -137,6 +137,60 @@ arbitrage and coarse neighbour-hydro budgets are refinements.
   to −16.8. A sweep of all 51 candidate coverage steps across every zone and technology found this to be
   the only large one in a scored zone — see `DECISIONS.md` for the adjudication and for the RES zero-bid
   sink, which is measured and held OFF pending a depth fix.
+  - **The repair reaches the PROJECTION fit too, not only the backtest.** It landed in `neighbour_netload`
+    (the backtest path) but not in `weather_shapes.NeighbourWeatherModel.fit` (the path every projected
+    year and every Monte-Carlo trajectory uses), so calibration and projection described two different
+    Switzerlands — the projected one still missing five sixths of its river. Measured on a 4-year run, that
+    put CH at **132.8 €/MWh in 2040** where the defect was masked to 28.6 by a second error since removed
+    (must-take scaled whole on the solar+wind factor, which multiplied the metered river 2.71x). Fitted CH
+    run-of-river goes 222 MW → **1573 MW** mean (1.95 → 13.78 TWh/yr).
+  - **The river must enter BOTH `mt` and `ror`.** `ch_hydro.apply_to_netload` adds only to
+    `musttake_res_mw`, and the fit derives `sw = mt - ror`, so incrementing `mt` alone hands the entire
+    repair to the solar+wind half — where `shape()` multiplies it by `res_growth` (CH 2040: **10.06x**)
+    instead of `ror_growth`. That renders 1.35 GW of Swiss river as 13.6 GW, **107 TWh/yr in a country
+    that consumes 60**, with nothing in the output that looks wrong. Adding to both leaves `mt - ror`
+    unchanged hour for hour. Three fitted artefacts depend on it, not one: `mean_sw_mw`, `sw_shape` (which
+    would otherwise carry the April–July freshet as "solar+wind climatology"), and `res_coef`, the
+    own-weather OLS regressing `sw` on wind cubed and clearness. Pinned by
+    `test_recovered_swiss_river_lands_in_the_run_of_river_half` and the `sw`-invariance test beside it.
+  - **`gb_embedded` had the SAME parity gap; now closed.** `weather_shapes.py` referenced neither
+    correction module — only `unclassified_gen`. Britain's embedded block is netted off LOAD in the
+    backtest and was not netted in the projection fit, so projected British load was gross against a stack
+    never asked to serve it. The fit now applies all three corrections in `neighbour_netload`'s order
+    (gb_embedded → unclassified → ch_hydro); order matters because gb_embedded floors load at zero after
+    subtracting and unclassified also moves load. Fitted GB load 32.86 → **27.30 GW** (287.8 → 239.1
+    TWh/yr) on the 2019 fit year, matching that year's 5562 MW residual exactly.
+  - **OPEN — `gb_embedded._MIN_CELL = 40` is UNREACHABLE, so the (month, hour) profile never applies.**
+    `embedded_profile` groups the residual into 12x24 = 288 cells and falls back to the YEAR MEDIAN for any
+    cell holding fewer than `_MIN_CELL` hours — but a (month, hour) cell in one year of hourly data holds
+    at most 31. Measured: **288 of 288 cells** below the threshold in both 2019 and 2024, so every cell is
+    overwritten and the delivered block is FLAT. The shape the module documents is therefore never
+    produced: 2024's true July-12h median is 671 MW against January-12h 5273 MW, and both are replaced by
+    a flat 6164 MW. This predates the parity work and affects the BACKTEST as well — every gate number
+    `io/gb_embedded.py` records was measured with a flat block, so lowering the threshold would invalidate
+    that calibration and needs its own gate re-run to judge. Not changed here.
+  - **FIXED — AT_SI's fit-year anchor was AUSTRIA ONLY: Slovenia was absent from the lake before 2024.**
+    `entsoe_load` and `entsoe_generation` both start **2024-01-01** for `SI`, while `AT` runs from 2019.
+    `NeighbourWeatherModel.fit` sums the composite's constituents (`weather_shapes.py`, via
+    `constituents("AT_SI") == ["AT", "SI"]`), so on the 2019 fit year the SQL returns Austria alone and
+    `mean_load_mw` records an Austria-only anchor as if it were AT+SI: **63.1 TWh against the workbook's
+    87.0** (ratio 0.73, where nine of eleven zones sit within 1–4 %). It fails SILENTLY because the
+    sufficiency guard tests the COMPOSITE — 8,760 valid Austrian hours clear the 500-hour threshold easily
+    — and no code path checks per-constituent coverage.
+    The error is not a level shift: it drops Slovenia's ~14 TWh of demand while keeping Austria's
+    hydro-heavy must-take, so the zone is left structurally surplus. This is a direct suspect for AT_SI
+    pricing at or below zero in **6,610 of 8,736 hours** in 2040. Fixing it means backfilling SI from
+    ENTSO-E or moving the fit year, neither of which is a projection-path change — hence OPEN.
+    RESOLVED by backfilling SI load and generation for 2019/2022/2023 via `pricemodeling.entsoe.series`
+    with `zones={"SI": "SI"}` — `backfill_entsoe.py` only ever ran the 7-zone `ZONES` set for the historic
+    years, and SI lives in `DE_REST_ZONES`. Slovenia contributes 14.1 TWh of load and 14.8 TWh of
+    generation on 2019, taking the anchor **63.1 → 77.2 TWh** (ratio 0.73 → **0.89**) and must-take run-of-
+    river 3145 → 3638 MW. `fit` now also emits a per-constituent coverage WARNING, since the composite
+    sufficiency guard structurally cannot catch this — pinned by
+    `test_a_composite_zone_missing_a_constituent_is_reported_not_silent`.
+    The residual 0.89 is a workbook DEFINITION gap, not a coverage gap: metered AT+SI is 77.2 TWh against
+    an 87.0 TWh `demand_twh` row, so that row was not built from the metered lake the way the others were.
+    Left alone — changing it is a scenario decision, not a data repair.
 - **Italian nameplate** (`io/area_capacity.py`, opt-in, currently OFF): ENTSO-E publishes installed
   capacity for Italy at CONTROL-AREA level only — every bidding-zone request returns `nodata` — so the
   Italian stack runs on the p99.9-of-generation fallback, which under-reads energy-limited plant worst

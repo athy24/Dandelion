@@ -40,6 +40,10 @@ def main() -> int:
     ap.add_argument("--ref-year", type=int, default=2019)
     ap.add_argument("--draw", type=int, default=0)
     ap.add_argument("--out", default="scratchpad/proj20y")
+    ap.add_argument("--years", default=None,
+                    help="explicit comma-separated years instead of a contiguous range, e.g. "
+                         "2030,2035,2040,2046. One preload serves them all, which is what makes a "
+                         "sparse comparison affordable when the preload costs more than a solved year.")
     ap.add_argument("--n-weeks", type=int, default=None, help="truncate each year (smoke runs)")
     args = ap.parse_args()
 
@@ -47,7 +51,8 @@ def main() -> int:
     hz = cfg.section("projection").get("horizon", {})
     start = args.start or int(hz.get("start_year", 2027))
     end = args.end or int(hz.get("end_year", 2046))
-    years = list(range(start, end + 1))
+    years = ([int(y) for y in args.years.replace(" ", "").split(",") if y]
+             if args.years else list(range(start, end + 1)))
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -56,7 +61,8 @@ def main() -> int:
     os.environ["DISPATCH_CAPTURE_DISPATCH"] = "1"
 
     todo = [y for y in years if not (out / f"prices_{y}.parquet").exists()]
-    print(f"[20y] horizon {start}-{end} ({len(years)} years), {len(todo)} to run, draw={args.draw}",
+    _span = args.years if args.years else f"{start}-{end}"
+    print(f"[20y] horizon {_span} ({len(years)} years), {len(todo)} to run, draw={args.draw}",
           flush=True)
     if not todo:
         print("[20y] nothing to do", flush=True)
@@ -73,7 +79,7 @@ def main() -> int:
         provider = default_weather_provider
 
     stats = []
-    prog = Progress(len(todo), f"projection {start}-{end}")
+    prog = Progress(len(todo), f"projection {_span}")
     prog.__enter__()
     for y in todo:
         t1 = time.monotonic()

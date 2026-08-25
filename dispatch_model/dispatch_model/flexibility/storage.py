@@ -90,6 +90,17 @@ def storage_spec(psp_mw: dict[str, float], year: int, tyndp: dict | None = None)
     for z in set(psp_mw) | set(_BESS_2024) | wb_zones:
         p_dis, p_ch, e_max, ech, edis, vch = [], [], [], [], [], []
         psp = float(psp_mw.get(z, 0.0))
+        if psp <= 0.0 and tyndp:
+            # `storage_spec` is called with an EMPTY psp_mw, so a zone absent from `_PSP_MEASURED` used to
+            # get NO pumped storage whatsoever — AT_SI, PL_CZ, IT-North, GB and PT among them, though
+            # Austria runs ~3.7 GW and Italy ~7.5. Fall back to the workbook's stated nameplate and let the
+            # measured derate below turn it into an effective envelope, so the workbook is the single
+            # source of truth for a fleet that physically exists.
+            zt = tyndp.get(z) or {}
+            if "cap_psp_gw" in zt:
+                from ..tyndp import _interp
+                v = _interp(zt["cap_psp_gw"], year)
+                psp = float(v) * 1e3 if v else 0.0
         meas = _PSP_MEASURED.get(z)
         if meas:
             p, e = meas[0] * 1e3, meas[1] * 1e3

@@ -151,6 +151,8 @@ class NeighbourWeatherModel:
     def __init__(self, load_coef: dict, res_beta: dict, res_shape: dict, fr_res_clim: np.ndarray,
                  res_coef: dict | None = None, own_weather: set | None = None):
         self.res_coef = res_coef or {}    # zone -> OLS coef on _res_design (own wind + own clearness)
+        self.ror_shape: dict = {}         # zone -> unit-mean run-of-river climatology (own driver: hydro)
+        self.sw_shape: dict = {}          # zone -> unit-mean solar+wind climatology
         self.own_weather = own_weather or set()   # zones fitted on THEIR weather, not the FR proxy
         self.load_coef = load_coef        # zone -> OLS coef on _design (mean load level absorbed by intercept)
         self.res_beta = res_beta          # zone -> {mean_res_mw, mean_load_mw}: RES level anchor
@@ -167,6 +169,7 @@ class NeighbourWeatherModel:
         temperature = _fr_hist_weather(config)
         load_coef, res_beta, res_shape = {}, {}, {}
         res_coef, own_weather = {}, set()
+        ror_shape, sw_shape = {}, {}
         zhist = zone_hist_weather(config)          # {} on a France-only cube -> FR-proxy fallback
         # FR own must-take RES climatology — the baseline the FR draw's anomaly is measured against (so a
         # windier-than-FR-normal draw lifts every neighbour's own shape proportionally). Falls back to a flat
@@ -182,7 +185,22 @@ class NeighbourWeatherModel:
         # is the reference whose weather drives every other zone's fit, not a zone being fitted.
         zones = [z for z in config.all_zones if z != "FR"]
         for z in zones:
-            ld = load_demand_hist(config, year, zones=constituents(z)).groupby("timestamp_utc")["load_mw"].sum()
+            _parts = constituents(z)
+            _raw = load_demand_hist(config, year, zones=_parts)
+            ld = _raw.groupby("timestamp_utc")["load_mw"].sum()
+            # PER-CONSTITUENT COVERAGE, because a COMPOSITE zone can lose a whole country in silence.
+            # `AT_SI` is AT+SI, but SI was absent from the lake before 2024 while AT ran from 2019, so the
+            # 2019 fit summed ONE constituent and recorded an Austria-only anchor (63.1 TWh) as if it were
+            # both (workbook 87.0). The sufficiency guard below could not catch it: it tests the COMPOSITE,
+            # and 8760 valid Austrian hours clear a 500-hour threshold effortlessly. Worse than a level
+            # error, it dropped Slovenia's demand while keeping Austria's hydro-heavy must-take, leaving
+            # the zone structurally surplus — a direct cause of AT_SI pricing <= 0 in 6596 hours of 2040.
+            if len(_parts) > 1 and not _raw.empty and "zone" in _raw.columns:
+                _seen = {str(k) for k, v in _raw.groupby("zone")["load_mw"].count().items() if v >= 500}
+                if (_missing := [c for c in _parts if c not in _seen]):
+                    print(f"[weather_shapes] WARNING {z} fit-year {year}: constituent(s) {_missing} have "
+                          f"no usable load history; the zone's demand anchor covers {sorted(_seen)} only "
+                          f"and is understated.", flush=True)
             # THE SUFFICIENCY GUARD STAYS AHEAD OF `load_generation_hist`. An earlier version of this
             # correction hoisted the generation read above it, which crashed the whole fit with
             # `KeyError: 'tech'` on the first zone that has load rows but no generation rows — an empty
@@ -193,6 +211,16 @@ class NeighbourWeatherModel:
             g = load_generation_hist(config, year, zones=constituents(z))
             mt = (g[g["tech"].isin(_MUSTTAKE)].groupby("timestamp_utc")["gen_mw"].sum()
                   if not g.empty and "tech" in g.columns else pd.Series(dtype=float))
+            # RUN-OF-RIVER IS SPLIT OUT, because it does not grow when a country builds solar panels.
+            # `_MUSTTAKE` mixes hydro_ror with solar and wind, and the whole basket used to be scaled by a
+            # factor derived from `cap_solar_gw + cap_wind_gw` alone. On hydro-heavy zones that is a
+            # category error with a large number attached: AT_SI's 2019 must-take is 76 % Austrian
+            # run-of-river and its 2040 factor is 7.39, so Austria's rivers were modelled at 7.4x their
+            # flow — 30.5 GW of mean "RES" against a 14.3 GW peak demand, which pinned the zone at the
+            # curtailment bid in all 8736 hours of the year. IT-North was overstated 3.09x, CH 2.71x.
+            ror = (g[g["tech"] == "hydro_ror"].groupby("timestamp_utc")["gen_mw"].sum()
+                   if not g.empty and "tech" in g.columns else pd.Series(dtype=float))
+            ror = ror.reindex(mt.index).fillna(0.0) if len(mt) else ror
             # `_MUSTTAKE` alone reads NL's solar as a 0.4 GW stub, because TenneT reports the Dutch fleet
             # under `Other` (see `io.unclassified_gen`). This path is the one the Monte Carlo trajectories
             # use, so it needs the same correction `neighbour_netload` applies to the backtest — otherwise
@@ -203,10 +231,44 @@ class NeighbourWeatherModel:
             # It is applied BEFORE the temperature regression, not after: `load_coef` is what `shape()`
             # evaluates to produce a projected `load_mw`, so fitting it on gross load while reporting a net
             # `mean_load_mw` would leave the two halves of this model describing different quantities.
+            #
+            # ALL THREE CORRECTIONS, IN `neighbour_netload`'s ORDER. The backtest applies gb_embedded ->
+            # unclassified -> ch_hydro; this fit applied only the middle one, so the calibrated model and
+            # the projected one were not the same model. Order is not cosmetic: gb_embedded floors load at
+            # zero after subtracting, and unclassified also moves load, so running them in the other order
+            # can clip differently.
+            _d = pd.DataFrame({"load_mw": ld, "musttake_res_mw": mt.reindex(ld.index).fillna(0.0)})
+            # GB only: Elexon meters generation at the TRANSMISSION boundary while ITSDO demand is already
+            # net of distribution-connected plant, so the two feeds do not close — 5.85 GW mean on 2024,
+            # 17.0 % of GB demand on this fit year. Netting it off load is what the backtest does; leaving
+            # it in made projected British demand gross against a stack that never had to serve it.
+            from .io.gb_embedded import apply_to_netload as apply_gb_embedded
+            _d = apply_gb_embedded(config, z, year, _d)
             from .io.unclassified_gen import apply_to_netload as apply_unclassified
-            _d = apply_unclassified(config, z, year, pd.DataFrame(
-                {"load_mw": ld, "musttake_res_mw": mt.reindex(ld.index).fillna(0.0)}))
+            _d = apply_unclassified(config, z, year, _d)
+            # CH only: ~11.8 TWh/yr of run-of-river ENTSO-E never metered before its 2025 feed repair.
+            # The BACKTEST has carried this since `io.ch_hydro` (see `neighbours.blocks`); this fit did
+            # NOT, so calibration and projection described two different Switzerlands — the projected one
+            # missing five sixths of its river. Same correction, same position in the order, one country.
+            from .io.ch_hydro import apply_to_netload as apply_ch_ror
+            _d = apply_ch_ror(config, z, year, _d)
             ld, mt = _d["load_mw"], _d["musttake_res_mw"]
+            # `apply_unclassified` adds recovered SOLAR, so it lands in the solar+wind half by construction
+            ror = ror.reindex(mt.index).fillna(0.0) if len(mt) else ror
+            # ...but `apply_ch_ror` adds recovered RIVER, and `sw = mt - ror` would hand every added MW to
+            # the solar+wind half, where `shape()` multiplies it by the zone's SOLAR+WIND growth factor
+            # (CH 2040: x10.06) rather than the hydro factor. That turns 1.35 GW of Swiss river into
+            # 13.6 GW — 107 TWh/yr in a country that consumes 60, and it would arrive silently. The river
+            # therefore enters BOTH series: `mt - ror` is then unchanged hour for hour, so `sw` stays the
+            # solar+wind it always was, and the addition rides `ror_growth` where it belongs.
+            #
+            # Three fitted artefacts depend on this, not one: `mean_sw_mw` (the level), `sw_shape` (which
+            # would otherwise carry the April-July freshet as "solar+wind climatology"), and `res_coef`,
+            # the own-weather OLS that regresses `sw` on wind cubed and clearness — a river in its target
+            # makes that response meaningless.
+            if "ch_missing_ror_mw" in _d.columns:
+                ror = ror + _d["ch_missing_ror_mw"].reindex(ror.index).fillna(0.0)
+            sw = (mt - ror).clip(lower=0.0)
             # OWN-ZONE WEATHER where the cube provides it, the FR proxy only as a fallback. Regressing a
             # Danish load on French temperature forces a correlation of 1 between their heating demand,
             # which makes European peaks look simultaneous and imports look available exactly when they
@@ -226,25 +288,32 @@ class NeighbourWeatherModel:
                 own_weather.add(z)
             # RES: the zone's OWN observed must-take shape (unit-mean) + its mean level (#157).
             res_beta[z] = {"mean_res_mw": float(mt.mean()) if len(mt) else 0.0,
+                           "mean_ror_mw": float(ror.mean()) if len(ror) else 0.0,
+                           "mean_sw_mw": float(sw.mean()) if len(sw) else 0.0,
                            "mean_load_mw": float(ld.mean())}
             res_shape[z] = _norm_shape(mt, year)
+            ror_shape[z] = _norm_shape(ror, year) if len(ror) and ror.mean() > 0 else None
+            sw_shape[z] = _norm_shape(sw, year) if len(sw) and sw.mean() > 0 else None
             # own-weather RES response, where the zone has both its own weather and a must-take series
             if zw is not None and len(mt) and {"wind_speed_ms", "cloud_cover_pct"} <= set(zw.columns):
-                jr = pd.DataFrame({"res": mt}).join(zw, how="inner").dropna()
+                jr = pd.DataFrame({"res": sw}).join(zw, how="inner").dropna()
                 if len(jr) >= 500:
-                    clim = _norm_shape(mt, year)
+                    clim = _norm_shape(sw, year)
                     pos = pd.DatetimeIndex(jr.index).dayofyear.to_numpy() * 24 +                         pd.DatetimeIndex(jr.index).hour.to_numpy()
                     cl = np.resize(clim, max(pos.max() + 1, len(clim)))[np.clip(pos, 0, len(clim) - 1)]
                     Xr = _res_design(jr["wind_speed_ms"].to_numpy(),
                                      jr["cloud_cover_pct"].to_numpy(), cl)
                     br, *_ = np.linalg.lstsq(Xr, jr["res"].to_numpy(), rcond=None)
                     res_coef[z] = br.tolist()
-        return NeighbourWeatherModel(load_coef, res_beta, res_shape, fr_res_clim,
-                                     res_coef=res_coef, own_weather=own_weather)
+        m = NeighbourWeatherModel(load_coef, res_beta, res_shape, fr_res_clim,
+                                  res_coef=res_coef, own_weather=own_weather)
+        m.ror_shape, m.sw_shape = ror_shape, sw_shape
+        return m
 
     def shape(self, zone: str, target_year: int, fr_temp: pd.Series, fr_res_cf: pd.Series,
               load_growth: float = 1.0, res_growth: float = 1.0,
-              zone_weather: pd.DataFrame | None = None) -> pd.DataFrame | None:
+              zone_weather: pd.DataFrame | None = None,
+              ror_growth: float | None = None) -> pd.DataFrame | None:
         """Neighbour net-load [timestamp_utc, load_mw, musttake_res_mw] for `target_year`: load from the
         temperature response × growth; RES from the zone's OWN shape × the FR draw's renewable anomaly
         (draw/FR-climatology) × scaled mean × growth (#157 — own-weather, still draw-coherent)."""
@@ -268,23 +337,41 @@ class NeighbourWeatherModel:
         load = (_design(t, pd.DatetimeIndex(idx)) @ np.array(self.load_coef[zone])) * load_growth
         # own-weather RES: zone's own climatology × draw-vs-FR-normal anomaly (bounded), positional-aligned.
         own = np.resize(self.res_shape[zone], n) if zone in self.res_shape else np.ones(n)
+        # Run-of-river on ITS OWN driver (`cap_hydro_gw`), solar+wind on theirs. With no hydro factor
+        # supplied the caller gets the previous behaviour, so a caller not yet updated cannot silently
+        # lose the river — it keeps scaling with the RES factor exactly as before.
+        rb = self.res_beta[zone]
+        mean_ror = float(rb.get("mean_ror_mw", 0.0))
+        mean_sw = float(rb.get("mean_sw_mw", rb["mean_res_mw"]))
+        rg = res_growth if ror_growth is None else ror_growth
+        ror_part = np.zeros(n)
+        if mean_ror > 0 and self.ror_shape.get(zone) is not None:
+            ror_part = np.resize(self.ror_shape[zone], n) * mean_ror * rg
+        sw_clim = np.resize(self.sw_shape[zone], n) if self.sw_shape.get(zone) is not None else own
         _need = {"wind_speed_ms", "cloud_cover_pct"}
         if zw is not None and zone in self.res_coef and _need <= set(zw.columns):
             # own-weather RES: the zone's fitted response to ITS wind and ITS clearness. A Danish wind lull
             # is now a Danish event, instead of a rescaling of the French renewable anomaly.
             w = zw["wind_speed_ms"].reindex(idx).to_numpy(float)
             c = zw["cloud_cover_pct"].reindex(idx).to_numpy(float)
-            res = _res_design(w, c, own) @ np.array(self.res_coef[zone])
+            res = _res_design(w, c, sw_clim) @ np.array(self.res_coef[zone])
+            # CLIP BEFORE NORMALISING. An OLS response goes negative in low-wind, high-cloud hours, and the
+            # caller clips the frame at zero on the way out. Normalising the UNCLIPPED series and clipping
+            # afterwards therefore delivers a mean ABOVE the intended level by exactly the negative mass —
+            # measured, that inflated neighbour RES by +10 to +14 % system-wide and up to +21 % in
+            # IT-North, whose fit is the poorest, which then halved projected prices. Clipping first makes
+            # the normalisation act on the series actually delivered.
+            res = np.clip(res, 0.0, None)
             mean_fit = float(np.nanmean(res)) or 1.0
             # re-anchor on the fitted mean level, then apply capacity growth: the regression sets the SHAPE
             # and the anomaly, the scenario sets the level.
-            res = res / mean_fit * self.res_beta[zone]["mean_res_mw"] * res_growth
+            res = res / mean_fit * mean_sw * res_growth + ror_part
         else:
             draw = fr_res_cf.reindex(idx).to_numpy(float)
             draw = draw / (np.nanmean(draw) or 1.0)                # unit-mean FR draw shape
             clim = np.resize(self.fr_res_clim, n)
             coher = np.clip(np.divide(draw, clim, out=np.ones_like(draw), where=clim > 1e-6), 0.0, 3.0)
-            res = own * coher * self.res_beta[zone]["mean_res_mw"] * res_growth
+            res = sw_clim * coher * mean_sw * res_growth + ror_part
         return pd.DataFrame({"timestamp_utc": idx, "load_mw": np.clip(load, 0, None),
                              "musttake_res_mw": np.clip(res, 0, None)}).dropna().reset_index(drop=True)
 
@@ -330,9 +417,14 @@ def all_weather_shapes(config, target_year: int, realization: int = 0, nb_model:
         # France-only cube, in which case every zone falls back to the FR proxy exactly as before.
         zwx = _draw_zone_weather(config, realization)
         for z in nb_model.load_coef:
-            lg, rg = (growth or {}).get(z, (1.0, 1.0))
+            # (load, res) historically; (load, res, run-of-river) since the must-take split. Unpacked
+            # tolerantly so a caller still passing the 2-tuple keeps working.
+            _g = tuple((growth or {}).get(z, (1.0, 1.0)))
+            lg, rg = _g[0], _g[1]
+            _g = (growth or {}).get(z, (1.0, 1.0))
             s = nb_model.shape(z, target_year, temp, res_cf, load_growth=lg, res_growth=rg,
-                               zone_weather=zwx.get(z))
+                               zone_weather=zwx.get(z),
+                               ror_growth=(_g[2] if len(_g) > 2 else None))
             if s is not None and not s.empty:
                 out[z] = s
     return out
@@ -364,5 +456,7 @@ def default_weather_provider(config, target_year: int, draw: int = 0, ref_year: 
         tf = tyndp_factors(tyndp, z, target_year, ref_year) if tyndp else None
         lg = tf["demand"] if (tf and tf.get("demand")) else (1 + _G_FALLBACK["demand"]) ** k
         rg = tf["res"] if (tf and tf.get("res")) else (1 + _G_FALLBACK["res"]) ** k
-        growth[z] = (lg, rg)
+        # run-of-river follows the HYDRO capacity trajectory, not the solar+wind one
+        hg = (tf or {}).get("cap", {}).get("hydro_ror")
+        growth[z] = (lg, rg, hg if hg else 1.0)
     return all_weather_shapes(config, target_year, realization=draw, nb_model=nb, growth=growth)
