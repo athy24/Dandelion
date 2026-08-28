@@ -12,7 +12,7 @@ from __future__ import annotations
 import os
 
 # tCO2 per MWh_thermal of fuel burnt
-CO2_INTENSITY_TH = {"gas": 0.202, "coal": 0.340, "lignite": 0.364, "oil": 0.267, "biomass": 0.0}
+CO2_INTENSITY_TH = {"gas": 0.202, "coal": 0.340, "lignite": 0.364, "oil": 0.267, "biomass": 0.0, 'gas_embedded': 0.202, 'gas_import': 0.202}
 #: German/Polish/Czech lignite is MINE-MOUTH: dug in an opencast pit beside the plant, moved by conveyor,
 #: never traded and never shipped. Its cost is a production cost of roughly 1.2-1.8 €/GJ, i.e. ~4.3-6.5
 #: €/MWh_th, and it barely moves from year to year — it has no exposure to a seaborne market.
@@ -29,7 +29,15 @@ CO2_INTENSITY_TH = {"gas": 0.202, "coal": 0.340, "lignite": 0.364, "oil": 0.267,
 LIGNITE_FUEL_EUR_MWH_TH = 5.0
 
 # which commodity price drives each tech's fuel cost
-FUEL_COMMODITY = {"gas": "gas", "coal": "coal", "lignite": "lignite", "oil": "oil", "biomass": None}
+FUEL_COMMODITY = {"gas": "gas", "coal": "coal", "lignite": "lignite", "oil": "oil", "biomass": None,
+                   # Gas-fuelled blocks that must ESCAPE `participation_caps`. That clamp is a p99.9 of
+                   # METERED generation, and it is right for a metered fleet — nameplate offers phantom
+                   # capacity that never bids. It has no authority over plant the meter cannot see:
+                   # `gas_embedded` is distribution-connected (absent from Elexon's transmission feed by
+                   # construction) and `gas_import` stands in for Norwegian and Irish cable. Tagged
+                   # plain `gas` they were swept into GB's 0.3514 clamp — 2900 MW of cable reached the
+                   # solver as 1019 — which is why adding interconnection changed the VoLL count by zero.
+                   'gas_embedded': 'gas', 'gas_import': 'gas'}
 # default electrical-efficiency ranges (min, max) for per-unit dispersion; class mid used if single-valued
 EFF_RANGE = {
     "ccgt": (0.46, 0.60), "gas": (0.40, 0.58), "ocgt": (0.34, 0.42),
@@ -58,7 +66,7 @@ VOM = {"nuclear": 9.0, "gas": 2.5, "ccgt": 2.5, "ocgt": 3.5, "coal": 3.5, "ligni
        # Still a DEFAULT, not a revealed-behaviour measurement, and still load-bearing — it sets the
        # scarcity ceiling in every tight zone of every projected year. Override per run with
        # `DISPATCH_FLEX_VOM` (see `flex_vom`).
-       "flex": 180.0}
+       "flex": 180.0, 'gas_embedded': 2.5, 'gas_import': 2.5}
 
 
 def flex_vom() -> float:
@@ -100,6 +108,57 @@ def fuel_eur_mwh_th(commodity: str, prices: dict[str, float]) -> float:
             return prices["coal"]
         return float(prices.get("lignite", LIGNITE_FUEL_EUR_MWH_TH))
     return prices[commodity]
+
+
+#: GB's CARBON PRICE SUPPORT — a generation-specific carbon tax the rest of the footprint does not pay.
+#:
+#: Britain levies CPS on fuels used for electricity generation ON TOP of its emissions-trading price, at a
+#: rate frozen at GBP 18/tCO2 since April 2016 and confirmed at that level through 2027-28
+#: (House of Commons Library SN05927). `thermal_srmc` applies ONE `prices["co2"]` to every zone, so without
+#: this Britain's thermal fleet is modelled ~8-10 EUR/MWh cheaper than it really is: on a CCGT the adder is
+#: CO2_INTENSITY_TH["gas"] / efficiency x rate = +9.6 at 45 % efficiency, +8.7 at 50 %, +7.9 at 55 %.
+#:
+#: SCRAPPED IN APRIL 2026, so it is NOT applied to the projection horizon — the Treasury abolished it
+#: following the 2025 Autumn Budget. Modelling it out to 2050 would invent a tax that no longer exists.
+#: The 2026 boundary is the assumption here; the mechanism ran for a decade either side of it.
+#:
+#: HOW MUCH OF GB'S PRICE GAP THIS EXPLAINS: not much, and that is the point of measuring it. GB's modelled
+#: 2025 mean is 59.6 EUR/MWh against 93.4 observed. CPS only bites in hours where gas is MARGINAL, and the
+#: model has gas marginal in 28.2 % of GB hours against 60.4 % observed — so it is worth about +2.5 EUR/MWh
+#: on the annual mean, roughly 7 % of the gap. The other 93 % is the marginality deficit itself.
+_GB_CPS_GBP_PER_T = 18.0
+#: GBP->EUR. A fixed rate, deliberately: CPS is a frozen nominal tax and this is a scenario model, not an
+#: FX model. (`ecb_fx` in the lake carries dated rates if a future pass wants them hour by hour.)
+_GBP_EUR = 1.18
+#: Last year CPS is charged. 2026 is the abolition year; from 2027 the adder is zero.
+_GB_CPS_LAST_YEAR = 2026
+
+
+def carbon_adder_eur_t(zone: str, year: int) -> float:
+    """Zone- and year-specific carbon cost ON TOP of the traded CO2 price (EUR/tCO2). 0 everywhere but GB.
+
+    Read at call time via `DISPATCH_GB_CPS` (EUR/t) so a sensitivity can move or disable it."""
+    # year <= 0 means the caller had no timestamp. Applying a dated tax to an unknown year would leak it
+    # into every year including the projection, so an unknown year gets nothing.
+    if str(zone) != "GB" or int(year) <= 0 or int(year) > _GB_CPS_LAST_YEAR:
+        return 0.0
+    v = os.environ.get("DISPATCH_GB_CPS")
+    if v is not None:
+        try:
+            return max(float(v), 0.0)
+        except ValueError:
+            pass
+    return _GB_CPS_GBP_PER_T * _GBP_EUR
+
+
+def zone_prices(prices: dict, zone: str, year: int) -> dict:
+    """`prices` with any zone-specific carbon adder folded into `co2`. Identity outside GB."""
+    add = carbon_adder_eur_t(zone, year)
+    if add <= 0.0:
+        return prices
+    out = dict(prices)
+    out["co2"] = float(out.get("co2", 0.0)) + add
+    return out
 
 
 def thermal_srmc(tech: str, efficiency: float, prices: dict[str, float], vom: float | None = None) -> float:

@@ -88,6 +88,7 @@ for the same reason.
 """
 from __future__ import annotations
 
+import os
 import sqlite3
 
 import numpy as np
@@ -95,7 +96,17 @@ import pandas as pd
 
 #: Fewest hours a (month, hour) cell needs before its median is trusted; below it the cell falls back to
 #: the whole-year median rather than to a value estimated from a handful of points.
-_MIN_CELL = 40
+#: Minimum hours in a (month, hour) cell before its own median is trusted; thinner cells fall back to
+#: the year median. **It must be reachable.** At 40 it was not: `embedded_profile` groups ONE year into
+#: 12x24 = 288 cells, so a cell holds at most 31 hours and 288 of 288 fell back — every year, silently,
+#: making the delivered block a CONSTANT. The whole month-hour profile this module documents, and the
+#: solar double-count it exists to remove in shape rather than only on average, was never produced:
+#: measured on 2024, the true July-12h median is 671 MW against 5273 MW in January, and both were being
+#: replaced by a flat 6164 MW.
+#:
+#: 20 keeps the guard meaningful for a PARTIAL year (a half-populated cell still falls back) while
+#: admitting the 28-31 hours a complete year actually supplies.
+_MIN_CELL = 20
 
 
 def _balance_frame(config, year: int) -> pd.DataFrame | None:
@@ -162,6 +173,84 @@ def embedded_mw(config, year: int, index=None) -> pd.Series | None:
     return pd.Series([float(prof.get(k, fallback)) for k in key], index=idx)
 
 
+#: Share of the FIRM embedded block that is HEAT-LED and therefore must-run: it cannot set a price. The
+#: remainder is price-responsive and is bid into GB's stack as low-efficiency gas (embedded reciprocating
+#: engines, diesel/STOR, embedded OCGT), where it CAN be marginal.
+#:
+#: This split is what the module docstring above names as "WHAT WOULD ACTUALLY BE RIGHT", and BOTH pure
+#: forms are measurably wrong. Netting the whole block makes GB's net load equal its metered generation
+#: plus imports BY CONSTRUCTION — leftover slack -15 MW mean on 2019, +77 MW on 2024 — so the zone can
+#: always serve itself and prices at the bottom of its own stack: 881 modelled zero-or-negative hours
+#: against 3 observed in 2019, 2491 against 238 in 2025, and a 2025 mean of 53.4 against 93.4 observed.
+#: Pricing the whole block fails the other way, withdrawing the fleet exactly when the system is tight
+#: (687 VoLL hours in 2022). Pricing only the MINORITY scales the withdrawal down with it, while the
+#: heat-led majority still guarantees GB cannot run short.
+#:
+#: `DISPATCH_GB_MUSTRUN` overrides at call time; 1.0 restores the pre-split behaviour to the last MW.
+#:
+#: 0.75 IS A FITTED ASSUMPTION, NOT A MEASUREMENT, and the two available answers disagree — which is worth
+#: recording rather than smoothing over.
+#:
+#: THE COMPOSITION SOURCE says 0.65. Parsing 14,552 Embedded Capacity Register records (four DNO groups,
+#: 26.1 GW connected, 9.2 GW firm) against DUKES 2026 gives must-run 7.97 GW — CHP 2.2, energy-from-waste
+#: 1.9, biomass 1.5, landfill gas 0.9, anaerobic digestion 0.6, sewage gas 0.27, small hydro 0.6 — against
+#: price-responsive 4.30 GW (gas reciprocating engines 2.6, diesel/STOR 1.1, embedded OCGT 0.4, other 0.2).
+#: Removing small hydro, which GB's `hydro_ror` already carries in `_MUSTTAKE`, gives 0.63. An independent
+#: capacity-market route gives 0.80, though its own RAW basis gives 0.28 — a factor-of-three spread driven
+#: entirely by which register is treated as the population. Three adversarial verifiers recommended 0.62,
+#: 0.70 and 0.90. Excluding the outlier the evidence clusters 0.62-0.70.
+#:
+#: THE 2025 PRICE FIT says 0.75, and it says so because 0.65 BREAKS THIS MODEL. Swept against observed GB
+#: 2025 (mean 93.4, median 95.7, sd 47.9, 238 hours <= 0):
+#:
+#:     share   mean   median   hrs<=0   VoLL   sd/obs   MAE
+#:      1.00   53.4     49.6     2491      0    1.13x  44.8
+#:      0.85   56.9     61.4     2253      0    1.18x  42.5
+#:      0.75   59.6     70.4     2134      0    1.25x  41.5   <- MAE optimum, last arm that passes
+#:      0.65   68.9     74.7     2004      4    6.81x  47.2
+#:      0.55  101.6     79.2     1908     22   15.71x  76.1
+#:      0.45  130.9     81.0     1819     38   20.59x 102.1
+#:
+#: Below 0.75 the fleet starts withdrawing exactly when the system is tight — the same failure that got the
+#: fully-priced block rejected — and dispersion explodes past the markup panel's 2.0x gate. The level alone
+#: would prefer ~0.55 (mean 101.6 against 93.4 observed), but it buys that level with 22 VoLL hours GB has
+#: never had. 0.75 is where the level improves as far as it can WITHOUT reintroducing the pathology.
+#:
+#: THE DISAGREEMENT IS ITSELF A FINDING. The fleet's composition says 0.65 is right; this model cannot
+#: absorb 0.65 without running short. That points at GB's dispatchable stack being thin rather than at the
+#: ratio being wrong, and it is the next thing to look at. Until then GB stays too cheap — 59.6 against
+#: 93.4 observed on 2025, better than the 53.4 it was, and still 36 % low.
+_MUST_RUN_SHARE = 0.75
+
+#: Efficiency assigned to the priced tranche. Embedded reciprocating engines and diesel sets are small and
+#: inefficient, so the BOTTOM of the gas band is right; the band midpoint would price them as CCGTs.
+_PRICED_EFF = 0.40
+
+
+def must_run_share() -> float:
+    """Heat-led fraction of the firm embedded block. Read at each call site so a calibration sweep can move
+    it without reimporting."""
+    v = os.environ.get("DISPATCH_GB_MUSTRUN")
+    if v is None:
+        return _MUST_RUN_SHARE
+    try:
+        return min(max(float(v), 0.0), 1.0)
+    except ValueError:
+        return _MUST_RUN_SHARE
+
+
+def priced_block_mw(config, year: int) -> float:
+    """→ capacity (MW) of the PRICE-RESPONSIVE tranche for `year`; 0.0 when the split is off.
+
+    Sized on the p99 of the hourly block, not its mean: this is dispatchable CAPACITY, and a mean would let
+    the LP dispatch more than the fleet can deliver in exactly the hours that decide the price."""
+    share = 1.0 - must_run_share()
+    if share <= 0.0:
+        return 0.0
+    e = embedded_mw(config, year)
+    return float(np.quantile(e.to_numpy(), 0.99) * share) if e is not None else 0.0
+
+
 def apply_to_netload(config, zone: str, year: int, df: pd.DataFrame) -> pd.DataFrame:
     """Net GB's embedded generation off its load, in place of a supply block. No-op for other zones.
 
@@ -174,7 +263,11 @@ def apply_to_netload(config, zone: str, year: int, df: pd.DataFrame) -> pd.DataF
     emb = embedded_mw(config, year, index=df.index)
     if emb is None:
         return df
+    # ONLY THE HEAT-LED SHARE COMES OFF LOAD. The remainder is bid into GB's stack by
+    # `neighbours.blocks._build_neighbour_stack`, so it can be marginal instead of silently making GB able
+    # to serve itself in every hour. At `must_run_share() == 1.0` this is the previous behaviour exactly.
+    mr = must_run_share()
     out = df.copy()
-    out["gb_embedded_mw"] = emb.to_numpy()
-    out["load_mw"] = np.maximum(out["load_mw"].to_numpy() - emb.to_numpy(), 0.0)
+    out["gb_embedded_mw"] = emb.to_numpy() * mr
+    out["load_mw"] = np.maximum(out["load_mw"].to_numpy() - emb.to_numpy() * mr, 0.0)
     return out

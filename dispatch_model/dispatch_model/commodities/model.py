@@ -89,8 +89,19 @@ def zone_prices(prices: dict, zone: str, basis: dict, ts=None, gas_rules=None) -
     if gas_rules:
         from .gas_rules import adjust_gas
         gas = adjust_gas(prices["gas"], zone, ts, gas_rules, flat_basis=b)
-        return {**prices, "gas": gas}
-    return prices if b == 0.0 else {**prices, "gas": prices["gas"] + b}
+        out = {**prices, "gas": gas}
+    else:
+        out = prices if b == 0.0 else {**prices, "gas": prices["gas"] + b}
+    # A zone can also face its own CARBON price, not just its own gas hub. Great Britain levies Carbon
+    # Price Support on generation fuels on top of its traded CO2 price — GBP 18/tCO2, worth ~8.6 EUR/MWh
+    # on a CCGT — and nobody else in the footprint pays it. This is the single place every solve path
+    # reaches for a zone's prices (`rolling.windows.nb_window` and `rolling.assemble` both arrive here),
+    # so the adder belongs here rather than at one call site: putting it anywhere else silently applies
+    # it to one path and not the other, which is exactly the backtest/projection divergence this repo has
+    # already had to repair three times. 0 for every zone but GB, and 0 for GB after its 2026 abolition.
+    from ..stacks.costs import carbon_adder_eur_t
+    add = carbon_adder_eur_t(zone, (pd.Timestamp(ts).year if ts is not None else 0))
+    return out if add <= 0.0 else {**out, "co2": float(out.get("co2", 0.0)) + add}
 
 
 @dataclass

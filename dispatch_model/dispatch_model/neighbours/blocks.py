@@ -237,6 +237,11 @@ def _build_neighbour_stack(config: Config, zone: str, year: int, n_subblocks: in
             # 4.18, PSP 2.52 against 5.18). See `io.area_capacity`; opt-in, {} when it has no evidence.
             from ..io.area_capacity import allocated_capacity
             got = allocated_capacity(config, z, year)
+        # GB's capacity is a single 2019 snapshot — ENTSO-E stopped publishing it after Brexit and Elexon
+        # has no capacity register — so it must be walked forward from published closure and commissioning
+        # dates or the model runs Britain's 2019 fleet in every year. See `io.gb_capacity`.
+        from ..io.gb_capacity import apply as _gb_capacity
+        got = _gb_capacity(z, year, got)
         for tech, mw in got.items():
             installed[tech] = installed.get(tech, 0.0) + mw
     gen_by_tech = gen.groupby(["timestamp_utc", "tech"])["gen_mw"].sum().reset_index()
@@ -263,10 +268,31 @@ def _build_neighbour_stack(config: Config, zone: str, year: int, n_subblocks: in
             mn = FLEX.get(tech, (0.0, 1.0))[0]
             rows.append({"unit_id": f"{zone}_{tech}", "zone": zone, "tech": tech,
                          "capacity_mw": cap, "efficiency": np.nan, "min_gen_frac": mn})
-    # NB: GB's distribution-connected fleet is deliberately NOT added here as a priced block. That was
-    # tried and rejected on measurement — priced at gas SRMC it withdraws in the 2022 crisis exactly when
-    # the system is tight, giving 687 VoLL hours. It is netted off demand in `neighbour_netload` instead;
-    # `io.gb_embedded` carries the full result.
+    # GB's distribution-connected fleet is SPLIT, not all-or-nothing. Pricing the WHOLE block was tried
+    # and rejected on measurement — at gas SRMC it withdraws in the 2022 crisis exactly when the system is
+    # tight, giving 687 VoLL hours. But netting the whole block is the opposite failure and just as
+    # measurable: GB's net load becomes its metered generation plus imports BY CONSTRUCTION (leftover slack
+    # -15 MW mean on 2019, +77 on 2024), so the zone can always serve itself and prices at the bottom of
+    # its own stack — 881 modelled zero-or-negative hours against 3 observed in 2019, 2491 against 238 in
+    # 2025, with a 2025 mean of 53.4 against 93.4 observed.
+    # So only the HEAT-LED share is netted; the price-responsive remainder is bid here as low-efficiency
+    # gas, which is what embedded reciprocating engines and diesel/STOR sets physically are. See
+    # `io.gb_embedded.must_run_share`.
+    if zone == "GB":
+        from ..io.gb_embedded import priced_block_mw, _PRICED_EFF
+        _pb = priced_block_mw(config, year)
+        if _pb > 1.0:
+            rows.append({"unit_id": "GB_embedded_priced", "zone": zone, "tech": "gas_embedded",
+                         "capacity_mw": _pb, "efficiency": float(_PRICED_EFF), "min_gen_frac": 0.0})
+        # Britain is wired to Norway and Ireland, neither of which is a modelled zone. Without them GB
+        # runs out of CABLE rather than plant: in all 37 VoLL hours of the 2025 backtest it imports
+        # 5281 MW with every modelled border binding at 100 %, against a stack with 8.7 GW spare. See
+        # `io.gb_capacity.ext_import_mw` for the sizing and for why it is priced above GB's own gas.
+        from ..io.gb_capacity import ext_import_mw, _EXT_IMPORT_EFF
+        _ext = ext_import_mw(year)
+        if _ext > 1.0:
+            rows.append({"unit_id": "GB_import_external", "zone": zone, "tech": "gas_import",
+                         "capacity_mw": _ext, "efficiency": float(_EXT_IMPORT_EFF), "min_gen_frac": 0.0})
     return pd.DataFrame(rows)
 
 
@@ -361,6 +387,35 @@ def _year_reveals_fleet(config: Config, year: int) -> bool:
     return best >= _REVEAL_HOURS
 
 
+def revealing_caps(config: Config, zone: str, ref_year: int, horizon: int = 8) -> dict[str, float]:
+    """→ `participation_caps` from the most recent year that ACTUALLY revealed the fleet, searching back
+    from `ref_year + horizon`; `{}` if no year in range qualifies.
+
+    Exists because the PROJECTION's base year cannot reveal anything. `participation_caps` reads metered
+    generation, so it is a backtest instrument by construction, and `_year_reveals_fleet(2019)` is False —
+    2019 had ZERO hours above 150 EUR/MWh in every zone. The projection therefore built its base stack from
+    the one year whose measurement is meaningless, and never clamped: 99.3 GW of phantom thermal across the
+    footprint, of which GB gas 19.2, DE_LU coal 13.6, ES gas 11.1, DE_LU gas 9.1 and PL_CZ coal 8.6.
+
+    On 2025-01-08 Britain's entire gas fleet delivered 12.71 GW while the market cleared at 1555 EUR/MWh —
+    at that price every available megawatt runs — against a 32.53 GW ref-year stack. The shortfall is
+    closed and mothballed plant that never left the 2019 register, not capacity withheld."""
+    for y in range(int(ref_year) + horizon, int(ref_year) - 1, -1):
+        if not _year_reveals_fleet(config, y):
+            continue
+        # THE YEAR MUST ALSO BE COMPLETE. `participation_caps` accepts any series of 1000+ hours, which is
+        # right for a backtest asking about its own year but wrong here: the search runs forward and the
+        # most recent year is typically ingested only part-way. A p99.9 over January-July cannot see a
+        # fleet that peaks in December, and would clamp it to a summer maximum for the whole horizon.
+        g = load_generation_hist(config, y, zones=constituents(zone))
+        if g.empty or "tech" not in g.columns or g["timestamp_utc"].nunique() < 8000:
+            continue
+        caps = participation_caps(config, zone, y)
+        if caps:
+            return caps
+    return {}
+
+
 def participation_caps(config: Config, zone: str, year: int) -> dict[str, float]:
     """→ {tech: MW ceiling} — the REVEALED market-participating thermal fleet (p99.9 of observed gen),
     **only for years where the market actually revealed it**; `{}` (no clamp) otherwise.
@@ -382,6 +437,13 @@ def participation_caps(config: Config, zone: str, year: int) -> dict[str, float]
     if not _year_reveals_fleet(config, year):
         return {}                       # cheap year: p99.9 measures economics, not availability
     g = load_generation_hist(config, year, zones=constituents(zone))
+    # AN EMPTY FRAME HAS NO COLUMNS, so `g["tech"]` below is a KeyError rather than an empty selection.
+    # The backtest never reached this because it only ever asks for its own year, which by construction has
+    # data; `revealing_caps` searches FORWARD from the reference year and will land on years a zone has not
+    # been ingested for. Same failure the neighbour fit already documents — guarded at source so every
+    # caller inherits it, not just the one that happened to trip.
+    if g.empty or "tech" not in g.columns:
+        return {}
     out: dict[str, float] = {}
     for tech in ("gas", "coal", "lignite", "oil"):
         s = g[g["tech"] == tech].groupby("timestamp_utc")["gen_mw"].sum()

@@ -262,6 +262,7 @@ def test_a_zone_with_no_coverage_repair_is_untouched(monkeypatch):
 
 
 def test_british_embedded_generation_is_netted_off_projected_load(monkeypatch):
+    monkeypatch.setenv("DISPATCH_GB_MUSTRUN", "1.0")      # pin the MECHANISM, not the calibrated share
     """GB's two feeds are measured on different boundaries and do not close.
 
     Elexon meters transmission-connected plant while ITSDO demand is already net of distribution-connected
@@ -277,6 +278,7 @@ def test_british_embedded_generation_is_netted_off_projected_load(monkeypatch):
 
 
 def test_the_british_correction_touches_load_only_and_never_must_take(monkeypatch):
+    monkeypatch.setenv("DISPATCH_GB_MUSTRUN", "1.0")
     """`gb_embedded` nets off LOAD deliberately — the opposite of `ch_hydro`, which adds to MUST-TAKE.
 
     Heat-led embedded CHP runs on heat demand, not on price, so netting keeps it out of price formation.
@@ -329,3 +331,118 @@ def test_a_composite_zone_missing_a_constituent_is_reported_not_silent(monkeypat
     out = capsys.readouterr().out
     assert "AT_SI" in out and "SI" in out and "understated" in out, (
         f"a composite zone lost a constituent without saying so; stdout was: {out!r}")
+
+
+# --- evolving thermosensitivity ------------------------------------------------------------------------
+#
+# One scalar (`load_growth`) used to multiply the whole coefficient vector, so a zone's temperature
+# RESPONSE was frozen at its fit-year revealed pattern while its LEVEL grew. Air conditioning is spreading
+# fast, and the zones where it already dominates the summer peak are exactly the ones that matter:
+# IT-North fits +502 MW/degC on a 19.7 GW base, Spain +381 on 28.6 GW.
+
+
+def _thermo_model(cdd=400.0, hdd=200.0, base=20000.0, n=8760):
+    """A model with a known design-column climate normal, so energy neutrality is checkable by hand."""
+    idx = _idx(2019, n)
+    temp = np.linspace(-5.0, 35.0, n)                     # spans both the heating and cooling regimes
+    X = _design(temp, pd.DatetimeIndex(idx))
+    coef = [base, hdd, cdd, 0.0, 0.0, 0.0, 0.0, 0.0]
+    m = _model(own=set())
+    m.load_coef["DK"] = coef
+    m.design_mean["DK"] = X.mean(axis=0).tolist()
+    return m, X, np.array(coef)
+
+
+def test_cooling_growth_raises_the_cooling_coefficient():
+    """The point of the change: a 2050 heatwave must not be served by the fit year's AC fleet."""
+    m, _, coef = _thermo_model(cdd=400.0)
+    got = m._thermo_coef("DK", cool_growth=2.0, heat_growth=1.0)
+    assert got[2] > coef[2] * 1.5, (
+        f"cooling coefficient barely moved: {coef[2]:.0f} -> {got[2]:.0f} under a 2x AC factor")
+
+
+def test_reshaping_preserves_annual_energy_on_the_zone_climate_normal():
+    """The scenario's `demand_twh` stays the authority for the LEVEL.
+
+    Rescaling a coefficient changes the annual total, which would silently override the scenario, so the
+    reshaped vector is renormalised against the fit-year climate normal. On that climate the response must
+    integrate to exactly what it did before — the shape moves, the energy does not."""
+    m, _, coef = _thermo_model(cdd=400.0, hdd=200.0)
+    dm = np.array(m.design_mean["DK"])
+    for cg, hg in ((2.0, 1.0), (1.0, 1.6), (3.0, 0.7)):
+        got = m._thermo_coef("DK", cool_growth=cg, heat_growth=hg)
+        assert float(dm @ got) == pytest.approx(float(dm @ coef), rel=1e-9), (
+            f"annual energy drifted under (cool={cg}, heat={hg})")
+
+
+def test_a_hot_year_still_consumes_more_and_by_more_than_before():
+    """Energy neutrality is enforced on the CLIMATE NORMAL, never on the draw.
+
+    Renormalising against the draw would force every projected year to identical annual energy and delete
+    the weather signal entirely — a hot year would stop consuming more, which inverts the purpose. The
+    reshaped response must therefore deliver MORE in a hot draw than the frozen one did, not the same."""
+    m, _, coef = _thermo_model(cdd=400.0)
+    n = 8760
+    idx = _idx(2030, n)
+    hot = _design(np.full(n, 30.0), pd.DatetimeIndex(idx))       # a uniformly hot year
+    frozen = float(hot.mean(axis=0) @ coef)
+    evolved = float(hot.mean(axis=0) @ m._thermo_coef("DK", cool_growth=2.0, heat_growth=1.0))
+    assert evolved > frozen * 1.05, (
+        f"a hot draw gained nothing from a doubled AC fleet: {frozen:.0f} -> {evolved:.0f} MW")
+
+
+def test_a_negative_cooling_coefficient_is_floored_not_grown():
+    """GB fits -509 MW/degC, which is not a cooling response at all: its demand series is net of embedded
+    solar, so hot sunny hours read as low demand and the OLS books the anomaly against CDD. Multiplying
+    that by an AC growth factor would make British summer demand fall FASTER every decade — the artifact
+    compounding itself. Floor it at zero instead, which is the honest state of knowledge."""
+    m, _, coef = _thermo_model(cdd=-509.0)
+    got = m._thermo_coef("DK", cool_growth=3.6, heat_growth=1.0)
+    assert got[2] == pytest.approx(0.0, abs=1e-9), (
+        f"a negative cooling coefficient was scaled to {got[2]:.1f} instead of being floored at zero")
+    assert got[2] > coef[2], "the floor must raise a negative coefficient, never lower it"
+
+
+def test_absent_workbook_rows_reproduce_the_previous_behaviour_exactly():
+    """Additive, not a change of default: a zone the workbook says nothing about must be bit-identical."""
+    m, _, coef = _thermo_model()
+    np.testing.assert_allclose(m._thermo_coef("DK", 1.0, 1.0), coef, rtol=0, atol=0)
+
+
+def test_the_mechanism_can_be_disabled_outright(monkeypatch):
+    """`DISPATCH_THERMO_EVOL=0` restores the single-scalar behaviour, read at call time per repo policy."""
+    from dispatch_model.weather_shapes import _thermo_growth
+    ty = {"ES": {"ac_penetration_pct": {2019: 36.0, 2040: 57.6}}}
+    monkeypatch.delenv("DISPATCH_THERMO_EVOL", raising=False)
+    assert _thermo_growth(ty, "ES", 2040, 2019)[0] == pytest.approx(57.6 / 36.0, rel=1e-9)
+    monkeypatch.setenv("DISPATCH_THERMO_EVOL", "0")
+    assert _thermo_growth(ty, "ES", 2040, 2019) == (1.0, 1.0)
+
+
+def test_only_the_heat_led_share_of_the_british_block_comes_off_load(monkeypatch):
+    """The split is the whole point: netting ALL of it makes GB's net load equal its metered generation
+    plus imports by construction, so the zone can always serve itself and prices at the bottom of its own
+    stack (881 modelled zero-or-negative hours against 3 observed in 2019; 2491 against 238 in 2025).
+    Only the heat-led share may be netted — the rest is bid into the stack where it can be marginal."""
+    for share, expect in ((1.0, 4000.0), (0.75, 4250.0), (0.5, 4500.0), (0.0, 5000.0)):
+        monkeypatch.setenv("DISPATCH_GB_MUSTRUN", str(share))
+        m = _fit_cfg(monkeypatch, ror_mw=0.0, solar_mw=100.0, missing_mw=0.0,
+                     zone="GB", embedded_mw=1000.0, load_mw=5000.0)
+        got = m.res_beta["GB"]["mean_load_mw"]
+        assert got == pytest.approx(expect, rel=1e-3), (
+            f"must_run={share}: netted load {got:.0f}, expected {expect:.0f} "
+            f"(5000 - 1000 x {share})")
+
+
+def test_the_priced_tranche_is_sized_from_the_share_and_vanishes_when_it_is_one(monkeypatch):
+    """What comes off load must reappear in the stack, or GB silently loses capacity."""
+    from dispatch_model.io import gb_embedded as gbe
+    idx = _idx(2019, 8760)
+    monkeypatch.setattr(gbe, "embedded_mw",
+                        lambda config, y, index=None: pd.Series(np.full(8760, 1000.0), index=idx))
+    monkeypatch.setenv("DISPATCH_GB_MUSTRUN", "1.0")
+    assert gbe.priced_block_mw(None, 2019) == pytest.approx(0.0),         "at must_run=1.0 there is no priced tranche and the behaviour must be the old one exactly"
+    monkeypatch.setenv("DISPATCH_GB_MUSTRUN", "0.75")
+    assert gbe.priced_block_mw(None, 2019) == pytest.approx(250.0, rel=1e-3)
+    monkeypatch.setenv("DISPATCH_GB_MUSTRUN", "0.0")
+    assert gbe.priced_block_mw(None, 2019) == pytest.approx(1000.0, rel=1e-3)

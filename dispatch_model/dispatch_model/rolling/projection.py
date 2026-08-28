@@ -17,6 +17,8 @@ stacks per Monte-Carlo draw from REMIT-calibrated spreads (opt-in via `avail_rng
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import pandas as pd
 
@@ -124,7 +126,8 @@ def _hydro_expander(ref: dict, target_year: int):
     return apply
 
 
-def _scale_stack(stack: pd.DataFrame, k: int, g: dict, cap_factors: dict | None = None) -> pd.DataFrame:
+def _scale_stack(stack: pd.DataFrame, k: int, g: dict, cap_factors: dict | None = None,
+                 ceilings: dict | None = None) -> pd.DataFrame:
     """Evolve a stack's firm capacity to the projection year.
 
     With TYNDP (`cap_factors` = {tech: target/ref multiplier}, #76) each tech is scaled to its TYNDP
@@ -138,6 +141,34 @@ def _scale_stack(stack: pd.DataFrame, k: int, g: dict, cap_factors: dict | None 
             m = st["tech"] == tech
             if m.any():
                 st.loc[m, "capacity_mw"] *= f
+        # REVEALED CAPABILITY, applied to the PROJECTED level rather than to the base.
+        #
+        # `participation_caps` measures what a fleet actually delivers: at >150 EUR/MWh every available
+        # unit runs, yet observed output saturates far below nameplate — the rest is mothballed, reserve
+        # or long-outage plant that never bids. On 2025-01-08 Britain's whole gas fleet delivered 12.71 GW
+        # while the market cleared at 1555 EUR/MWh, against a 32.53 GW register. Footprint-wide the
+        # register carries 99.3 GW that never shows up.
+        #
+        # IT MUST NOT BE APPLIED TO THE BASE. The workbook trajectory is a ratio against the REGISTER, so
+        # scaling a clamped base subtracts the same retirement twice — measured, that put DE_LU coal at
+        # 2.7 GW in 2030 where the KVBG fixes 8.0, and PL_CZ coal at 8.2 GW against a stated 16, which is
+        # what drove PL_CZ to 269 EUR/MWh.
+        #
+        # AND ONLY WHERE THE FLEET IS NOT GROWING. A ceiling measured in 2025 says nothing about plant not
+        # yet built: PL_CZ gas runs 3.3 -> 13 GW on Poland's NECP against a 5.86 GW ceiling, and clamping
+        # that would delete the build programme. So the ceiling binds only when the trajectory is flat or
+        # declining (f <= 1), where every remaining MW is existing plant the measurement covers. Retirement
+        # also removes the non-delivering units FIRST, which is why `min` is right for a shrinking fleet
+        # and a proportional derate is not.
+        if ceilings:
+            for tech, ceil in ceilings.items():
+                f = float((cap_factors or {}).get(tech, 1.0))
+                if f > 1.0 or ceil <= 0:
+                    continue
+                m = st["tech"] == tech
+                tot = float(st.loc[m, "capacity_mw"].sum())
+                if m.any() and tot > ceil:
+                    st.loc[m, "capacity_mw"] *= ceil / tot
         return st
     retired = 0.0
     for tech in ("coal", "lignite"):
@@ -330,7 +361,9 @@ def project_year(config: Config, target_year: int, ref, n_weeks: int | None = No
         # C4 maneuverability in projection comes from the planned-outage scheduler (F1) — a separate hook not
         # yet wired here; projected reactors run `full` until it lands, same documented degrade as the backtest.
     nb_fac = {z: zfac(z) for z in neigh}
-    nb_stack = {z: _append_flex(_scale_stack(s, k, g, cap_factors=nb_fac[z][2]), z, tyndp, target_year)
+    nb_stack = {z: _append_flex(_scale_stack(s, k, g, cap_factors=nb_fac[z][2],
+                                             ceilings=(ref.get("nb_ceilings") or {}).get(z)),
+                                z, tyndp, target_year)
                 for z, s in ref["nb_stack"].items()}
     nb_stack = {z: _wv(s, z) for z, s in nb_stack.items()}      # same water-value treatment (see above)
     # neighbour-zone rigidity — the LAST instance of the one-price defect. `project_year` used to pass
@@ -569,6 +602,16 @@ def _preload(config: Config, ref_year: int, avail_years: list[int] | None = None
         except (KeyError, ValueError):
             neigh.remove(z); zones.remove(z)
     nb_stack = {z: s[~s["tech"].isin(_EXCLUDE_DISPATCH)].reset_index(drop=True) for z, s in nb_stack.items()}
+    # Revealed capability, measured once and carried to `project_year`, which applies it per TARGET year.
+    nb_ceilings: dict = {}
+    if os.environ.get("DISPATCH_PROJ_PARTICIPATION", "1") not in ("0", "false", "False"):
+        from ..neighbours.blocks import revealing_caps
+        nb_ceilings = {z: (revealing_caps(config, z, ref_year) or {}) for z in nb_stack}
+    # NB: revealed capability is NOT clamped onto the base stack. It was, and it double-subtracted — the
+    # workbook trajectory is a RATIO against the REGISTER, so scaling a clamped base applies the retirement
+    # twice: DE_LU coal reached 2.7 GW in 2030 where the KVBG fixes 8.0, and PL_CZ coal 8.2 GW where the
+    # trajectory says 16, which is why PL_CZ priced at 269 EUR/MWh. The clamp is applied per TARGET YEAR
+    # in `_scale_stack` instead — see the note there.
     nb_nl = {z: neighbour_netload(config, z, ref_year).set_index("timestamp_utc") for z in neigh}
     # NL behind-the-meter PV — the projection was MISSING this, exactly as it was missing the water value
     # below. `run_backtest` reconstructs it (backtest.py, `btm_solar`) because ~98 % of the Dutch solar
@@ -731,6 +774,7 @@ def _preload(config: Config, ref_year: int, avail_years: list[int] | None = None
             "static": static, "growth": _load_growth(wb),
             "hydro_curves": hydro_curves, "wv_seasonal": wv_seasonal, "nb_mustrun": nb_mustrun,
             "fr": fr, "fr_stack": fr_stack_base(config, latest_fleet_year(config)), "nb_stack": nb_stack,
+            "nb_ceilings": nb_ceilings,
             "nb_nl": nb_nl, "nb_res": nb_res, # hourly published NTC on the REFERENCE year — the window index T is reference-year
             # timestamps, so it slices directly (see assemble.hourly_ntc)
             "ntc": hourly_ntc(config, ref_year, default=flow_derived_ntc(config, ref_year)),

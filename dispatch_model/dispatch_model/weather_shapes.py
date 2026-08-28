@@ -158,6 +158,16 @@ class NeighbourWeatherModel:
         self.res_beta = res_beta          # zone -> {mean_res_mw, mean_load_mw}: RES level anchor
         self.res_shape = res_shape        # zone -> unit-mean OWN must-take RES climatology (fit-year hourly)
         self.fr_res_clim = fr_res_clim    # unit-mean FR must-take RES climatology — the coherence baseline
+        #: zone -> mean of each `_design` column over the FIT-YEAR weather. This is the zone's revealed
+        #: CLIMATE NORMAL, and it is what makes an evolving thermosensitivity energy-neutral: rescaling a
+        #: coefficient changes the annual total, so the reshaped response is renormalised against this
+        #: normal rather than against the draw. Renormalising against the DRAW would be wrong in a way
+        #: that defeats the whole model — it would force every projected year to the same annual energy
+        #: and delete the weather signal that a hot year consumes more.
+        self.design_mean: dict = {}
+        #: zone -> {mean_mw, shape}: fit-year NATIONAL solar, recorded only where the zone's load series is
+        #: measured on a different boundary from its generation (GB alone). See the note in `fit`.
+        self.solar_gross: dict = {}
 
     @staticmethod
     def fit(config, year: int = 2019) -> NeighbourWeatherModel:
@@ -167,7 +177,8 @@ class NeighbourWeatherModel:
         from .neighbours.blocks import constituents
 
         temperature = _fr_hist_weather(config)
-        load_coef, res_beta, res_shape = {}, {}, {}
+        load_coef, res_beta, res_shape, design_mean = {}, {}, {}, {}
+        solar_gross: dict = {}            # zone -> fit-year national solar (GB boundary gross-up)
         res_coef, own_weather = {}, set()
         ror_shape, sw_shape = {}, {}
         zhist = zone_hist_weather(config)          # {} on a France-only cube -> FR-proxy fallback
@@ -269,6 +280,24 @@ class NeighbourWeatherModel:
             if "ch_missing_ror_mw" in _d.columns:
                 ror = ror + _d["ch_missing_ror_mw"].reindex(ror.index).fillna(0.0)
             sw = (mt - ror).clip(lower=0.0)
+            # GB ONLY — THE BOUNDARY GROSS-UP, and why the fit has to record it.
+            # `gb_embedded` nets Britain's residual off LOAD, which is exact AT THE FIT YEAR: the residual
+            # is (firm embedded block - national solar), so netting it is algebraically identical to
+            # grossing demand up by solar and removing the firm block. It stops being exact the moment the
+            # two halves are PROJECTED, because they ride different factors — the netted block scales with
+            # `load_growth` (GB 2040: x1.59) while the same national solar on the SUPPLY side scales with
+            # `res_growth` (x6.12, the widest divergence in the footprint). Britain's solar is then credited
+            # to supply nearly four times faster than the demand it was netted against, which is what puts
+            # GB in surplus 72 % of hours and prices it at 13 EUR/MWh in 2040 against a market clearing
+            # near 80. Recording the fit-year solar lets `shape()` re-gross the demand side at the SAME
+            # rate the supply side grows. No other zone needs this: theirs is one TSO submission on one
+            # boundary, so load and generation already balance by construction.
+            if "gb_embedded_mw" in _d.columns:
+                _sol = (g[g["tech"] == "solar"].groupby("timestamp_utc")["gen_mw"].sum()
+                        if not g.empty and "tech" in g.columns else pd.Series(dtype=float))
+                _sol = _sol.reindex(mt.index).fillna(0.0)
+                if len(_sol) and float(_sol.mean()) > 0:
+                    solar_gross[z] = {"mean_mw": float(_sol.mean()), "shape": _norm_shape(_sol, year)}
             # OWN-ZONE WEATHER where the cube provides it, the FR proxy only as a fallback. Regressing a
             # Danish load on French temperature forces a correlation of 1 between their heating demand,
             # which makes European peaks look simultaneous and imports look available exactly when they
@@ -284,6 +313,7 @@ class NeighbourWeatherModel:
             X = _design(j["temperature_c"].to_numpy(), pd.DatetimeIndex(j.index))
             beta, *_ = np.linalg.lstsq(X, j["load"].to_numpy(), rcond=None)
             load_coef[z] = beta.tolist()
+            design_mean[z] = X.mean(axis=0).tolist()       # the zone's revealed climate normal
             if zw is not None:
                 own_weather.add(z)
             # RES: the zone's OWN observed must-take shape (unit-mean) + its mean level (#157).
@@ -308,12 +338,53 @@ class NeighbourWeatherModel:
         m = NeighbourWeatherModel(load_coef, res_beta, res_shape, fr_res_clim,
                                   res_coef=res_coef, own_weather=own_weather)
         m.ror_shape, m.sw_shape = ror_shape, sw_shape
+        m.design_mean = design_mean
+        m.solar_gross = solar_gross
         return m
+
+    def _thermo_coef(self, zone: str, cool_growth: float, heat_growth: float) -> np.ndarray:
+        """`load_coef[zone]` with the COOLING and HEATING terms re-scaled, renormalised so the zone's
+        annual energy on its OWN CLIMATE NORMAL is unchanged.
+
+        The defect this repairs: one scalar (`load_growth`) multiplied the whole coefficient vector, so a
+        zone's temperature RESPONSE was frozen at its fit-year revealed pattern. Air-conditioning is
+        spreading fast, so cooling should grow faster than base demand — most of all where AC already
+        dominates the summer peak (IT-North's fitted response is +502 MW/degC on a 19.7 GW base, Spain's
+        +381 on 28.6 GW). A 2050 Iberian heatwave was being served by a 2019 AC fleet.
+
+        ENERGY IS PRESERVED ON THE CLIMATE NORMAL, NOT ON THE DRAW, and the distinction is the whole
+        design. The scenario's `demand_twh` is the authority for the LEVEL, so re-scaling a coefficient
+        must not silently move the annual total; but renormalising against the DRAW would force every
+        projected year to identical annual energy and delete the weather signal — a hot year would stop
+        consuming more, which is the opposite of the point. So the correction factor is computed against
+        `design_mean`, the mean of each design column over the FIT-YEAR weather. On that climate the
+        reshaped response integrates to exactly what it did before; a hotter draw then genuinely
+        consumes more, and by MORE than it used to, because the cooling coefficient is larger.
+
+        A NEGATIVE COOLING COEFFICIENT IS NEVER GROWN — it is floored at zero first. GB fits -509 MW/degC,
+        which is not a cooling response at all: its demand series is net of embedded solar, so hot sunny
+        hours read as low demand and the OLS books the anomaly against CDD. Multiplying that by an AC
+        growth factor would make British summer demand fall FASTER every decade. The floor costs GB its
+        (spurious) negative summer slope in projection and leaves it with no cooling response, which is
+        the honest state of knowledge until the artifact itself is fixed."""
+        coef = np.asarray(self.load_coef[zone], dtype=float)
+        dm = self.design_mean.get(zone)
+        if dm is None or (cool_growth == 1.0 and heat_growth == 1.0):
+            return coef
+        c = coef.copy()
+        c[1] = coef[1] * heat_growth                              # HDD — electric-heating sensitivity
+        c[2] = max(float(coef[2]), 0.0) * cool_growth             # CDD — floored, never grown negative
+        dmv = np.asarray(dm, dtype=float)
+        base, resh = float(dmv @ coef), float(dmv @ c)
+        if resh <= 0 or base <= 0:
+            return coef                                           # degenerate fit: leave it alone
+        return c * (base / resh)
 
     def shape(self, zone: str, target_year: int, fr_temp: pd.Series, fr_res_cf: pd.Series,
               load_growth: float = 1.0, res_growth: float = 1.0,
               zone_weather: pd.DataFrame | None = None,
-              ror_growth: float | None = None) -> pd.DataFrame | None:
+              ror_growth: float | None = None,
+              cool_growth: float = 1.0, heat_growth: float = 1.0) -> pd.DataFrame | None:
         """Neighbour net-load [timestamp_utc, load_mw, musttake_res_mw] for `target_year`: load from the
         temperature response × growth; RES from the zone's OWN shape × the FR draw's renewable anomaly
         (draw/FR-climatology) × scaled mean × growth (#157 — own-weather, still draw-coherent)."""
@@ -334,7 +405,17 @@ class NeighbourWeatherModel:
         else:
             t = fr_temp.reindex(idx).to_numpy()
             zw = None
-        load = (_design(t, pd.DatetimeIndex(idx)) @ np.array(self.load_coef[zone])) * load_growth
+        load = (_design(t, pd.DatetimeIndex(idx))
+                @ self._thermo_coef(zone, cool_growth, heat_growth)) * load_growth
+        # GB BOUNDARY GROSS-UP. The fit-year netting folded national solar into the demand series, where it
+        # now rides `load_growth`; the SUPPLY side carries the same fleet at `res_growth`. Re-gross the
+        # demand side by the DIFFERENCE so both halves sit on one boundary again. `max(..., 0)` because the
+        # correction only ever adds: if RES grew slower than demand there is no double credit to undo.
+        # Shape follows the fit-year solar climatology, so the gross-up lands in the daylight hours that
+        # created it rather than being smeared flat across the year.
+        _sg = self.solar_gross.get(zone)
+        if _sg is not None and res_growth > load_growth:
+            load = load + np.resize(_sg["shape"], n) * _sg["mean_mw"] * (res_growth - load_growth)
         # own-weather RES: zone's own climatology × draw-vs-FR-normal anomaly (bounded), positional-aligned.
         own = np.resize(self.res_shape[zone], n) if zone in self.res_shape else np.ones(n)
         # Run-of-river on ITS OWN driver (`cap_hydro_gw`), solar+wind on theirs. With no hydro factor
@@ -419,12 +500,15 @@ def all_weather_shapes(config, target_year: int, realization: int = 0, nb_model:
         for z in nb_model.load_coef:
             # (load, res) historically; (load, res, run-of-river) since the must-take split. Unpacked
             # tolerantly so a caller still passing the 2-tuple keeps working.
+            # (load, res) historically, then (…, run-of-river), now (…, cooling, heating). Unpacked
+            # positionally and tolerantly so a caller passing any earlier arity keeps working.
             _g = tuple((growth or {}).get(z, (1.0, 1.0)))
             lg, rg = _g[0], _g[1]
-            _g = (growth or {}).get(z, (1.0, 1.0))
             s = nb_model.shape(z, target_year, temp, res_cf, load_growth=lg, res_growth=rg,
                                zone_weather=zwx.get(z),
-                               ror_growth=(_g[2] if len(_g) > 2 else None))
+                               ror_growth=(_g[2] if len(_g) > 2 else None),
+                               cool_growth=(_g[3] if len(_g) > 3 else 1.0),
+                               heat_growth=(_g[4] if len(_g) > 4 else 1.0))
             if s is not None and not s.empty:
                 out[z] = s
     return out
@@ -435,6 +519,37 @@ def _neighbour_model(config, fit_year: int = 2019) -> NeighbourWeatherModel:
     if fit_year not in _NB_MODEL_CACHE:
         _NB_MODEL_CACHE[fit_year] = NeighbourWeatherModel.fit(config, year=fit_year)
     return _NB_MODEL_CACHE[fit_year]
+
+
+def _thermo_growth(tyndp: dict | None, zone: str, target_year: int, ref_year: int) -> tuple[float, float]:
+    """→ (cooling_growth, heating_growth) for `zone`, both 1.0 when the workbook says nothing.
+
+    Cooling rides AC penetration, mirroring how `demand_model.projection.drivers.factor_cool` already
+    treats France — a ratio to the anchor year, not an absolute. Heating rides a stated electric-heating
+    sensitivity index that is ALREADY anchored at 1.0 in the reference year, so it is used as given.
+
+    Read at call time, never cached at import: `DISPATCH_THERMO_EVOL=0` turns the whole mechanism off and
+    restores the single-scalar behaviour exactly."""
+    import os
+    if os.environ.get("DISPATCH_THERMO_EVOL", "1") in ("0", "false", "False"):
+        return 1.0, 1.0
+    z = (tyndp or {}).get(zone) or {}
+    cg = hg = 1.0
+    if "ac_penetration_pct" in z:
+        ref = _interp_local(z["ac_penetration_pct"], ref_year)
+        tgt = _interp_local(z["ac_penetration_pct"], target_year)
+        if ref and tgt is not None and ref > 0:
+            cg = float(tgt) / float(ref)
+    if "heat_sensitivity_index" in z:
+        v = _interp_local(z["heat_sensitivity_index"], target_year)
+        if v is not None and v > 0:
+            hg = float(v)
+    return cg, hg
+
+
+def _interp_local(series: dict, year: int):
+    from .tyndp import _interp
+    return _interp(series, year)
 
 
 def default_weather_provider(config, target_year: int, draw: int = 0, ref_year: int = 2019,
@@ -458,5 +573,12 @@ def default_weather_provider(config, target_year: int, draw: int = 0, ref_year: 
         rg = tf["res"] if (tf and tf.get("res")) else (1 + _G_FALLBACK["res"]) ** k
         # run-of-river follows the HYDRO capacity trajectory, not the solar+wind one
         hg = (tf or {}).get("cap", {}).get("hydro_ror")
-        growth[z] = (lg, rg, hg if hg else 1.0)
+        # THERMOSENSITIVITY EVOLVES SEPARATELY FROM THE LEVEL. `load_growth` is an ANNUAL ENERGY ratio; it
+        # says nothing about how the response to a heatwave changes, and multiplying the whole coefficient
+        # vector by it froze each zone's revealed 2019 temperature response for the entire horizon. Cooling
+        # follows AC penetration (workbook `ac_penetration_pct`), heating an electrification index
+        # (`heat_sensitivity_index`). Absent rows give 1.0, i.e. exactly the previous behaviour, so this is
+        # additive rather than a change of default. `DISPATCH_THERMO_EVOL=0` disables it outright.
+        cg, hg2 = _thermo_growth(tyndp, z, target_year, ref_year)
+        growth[z] = (lg, rg, hg if hg else 1.0, cg, hg2)
     return all_weather_shapes(config, target_year, realization=draw, nb_model=nb, growth=growth)

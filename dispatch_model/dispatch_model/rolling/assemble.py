@@ -500,6 +500,9 @@ def _fr_inputs(config, start, end, prices, nuc_avail_mult: float = 1.0) -> dict:
 def _neighbour_inputs(config, zone, start, end, year, prices, ref_times) -> dict:
     st = build_neighbour_stack(config, zone, year)
     st = st[~st["tech"].isin(_EXCLUDE_DISPATCH)].reset_index(drop=True)
+    # NB: the zone's CARBON adder (GB's Carbon Price Support) is applied upstream in
+    # `commodities.model.zone_prices`, which is the one function every solve path reaches for a zone's
+    # prices. Applying it here as well would double-charge Britain on this path only.
     st = st.assign(srmc_eur_mwh=srmc(st, prices).to_numpy())
     nl = neighbour_netload(config, zone, year).set_index("timestamp_utc").reindex(ref_times)
     nl[["load_mw", "musttake_res_mw"]] = nl[["load_mw", "musttake_res_mw"]].interpolate().ffill().bfill()

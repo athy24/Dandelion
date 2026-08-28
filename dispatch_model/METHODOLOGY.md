@@ -160,15 +160,125 @@ arbitrage and coarse neighbour-hydro budgets are refinements.
     (gb_embedded → unclassified → ch_hydro); order matters because gb_embedded floors load at zero after
     subtracting and unclassified also moves load. Fitted GB load 32.86 → **27.30 GW** (287.8 → 239.1
     TWh/yr) on the 2019 fit year, matching that year's 5562 MW residual exactly.
-  - **OPEN — `gb_embedded._MIN_CELL = 40` is UNREACHABLE, so the (month, hour) profile never applies.**
+  - **FIXED — `gb_embedded._MIN_CELL = 40` was UNREACHABLE, so the (month, hour) profile never applied.**
     `embedded_profile` groups the residual into 12x24 = 288 cells and falls back to the YEAR MEDIAN for any
     cell holding fewer than `_MIN_CELL` hours — but a (month, hour) cell in one year of hourly data holds
     at most 31. Measured: **288 of 288 cells** below the threshold in both 2019 and 2024, so every cell is
     overwritten and the delivered block is FLAT. The shape the module documents is therefore never
     produced: 2024's true July-12h median is 671 MW against January-12h 5273 MW, and both are replaced by
     a flat 6164 MW. This predates the parity work and affects the BACKTEST as well — every gate number
-    `io/gb_embedded.py` records was measured with a flat block, so lowering the threshold would invalidate
-    that calibration and needs its own gate re-run to judge. Not changed here.
+    `io/gb_embedded.py` records was measured with a flat block. Lowered to **20**, which keeps the guard
+    meaningful for a PARTIAL year (a half-populated cell still falls back) while admitting the 28-31 hours
+    a complete year supplies. The profile is now delivered shaped: 2019 spans 2173-9363 MW against a flat
+    5562, and 2024's July-12h reads 671 MW against January-12h 5273. Re-scored on the multi-year gate
+    rather than asserted — see the entry below.
+    A measured side effect: GB's fitted COOLING coefficient improves from **-509 to -336 MW/degC**. That
+    coefficient is an artifact of the same defect (ITSDO is net of embedded solar, so hot sunny hours read
+    as low demand and the OLS books the anomaly against CDD), and removing more block at summer noon
+    shrinks it by a third. It is smaller, not gone.
+- **Revealed capability replaces the register in the PROJECTION** (`rolling.projection._scale_stack`,
+  `neighbours.blocks.revealing_caps`): `participation_caps` clamps each thermal tech to the p99.9 of
+  observed generation, because nameplate offers capacity that never bids — mothballed, strategic-reserve
+  and long-outage plant. `run_backtest` has applied it since it was written; the PROJECTION never did,
+  because its base year cannot measure a fleet: `_year_reveals_fleet(2019)` is False (2019 had zero hours
+  above 150 EUR/MWh in every zone). So the projection built from the one year whose measurement is
+  meaningless and carried **99.3 GW of phantom thermal** for the whole horizon — GB gas 19.2, DE_LU coal
+  13.6, ES gas 11.1, DE_LU gas 9.1, PL_CZ coal 8.6, ES coal 7.5.
+  - The evidence that the ceiling is real, not a suppressed fleet: on **2025-01-08 Britain's entire gas
+    fleet delivered 12.71 GW while the market cleared at 1555 EUR/MWh**, against a 32.53 GW register. At
+    that price every available megawatt runs. GB gas has fallen from a 20.35 GW peak in 2019 to 13.62 in
+    2025 while the register still says 36.15.
+  - **Applied to the PROJECTED level, never to the base.** The workbook trajectory is a ratio against the
+    REGISTER, so clamping the base subtracts the same retirement twice. Measured when it was: DE_LU coal
+    reached 2.7 GW in 2030 where the KVBG fixes 8.0, PL_CZ coal 8.2 GW against a stated 16, and PL_CZ
+    priced at **269 EUR/MWh** — above the 132-190 gas band, i.e. permanent scarcity. Corrected, PL_CZ 2035
+    is 162.8 and every gas-marginal zone sits inside the band.
+  - **Only where the fleet is NOT growing.** A 2025 measurement says nothing about plant not yet built:
+    PL_CZ gas runs 3.3 -> 13 GW on Poland's NECP against a 5.86 GW ceiling. The ceiling binds only at
+    `f <= 1`, where every remaining MW is existing plant the measurement covers, and retirement removes
+    the non-delivering units first — which is why `min` is right for a shrinking fleet and a proportional
+    derate is not. `DISPATCH_PROJ_PARTICIPATION=0` disables.
+  - `revealing_caps` requires a COMPLETE year (>= 8000 metered hours). `participation_caps` accepts any
+    1000-hour series, which is right for a backtest asking about its own year and wrong for a forward
+    search: the most recent year is typically ingested part-way, and a p99.9 over January-July cannot see
+    a fleet that peaks in December. It selected partial-2026 until this was added, which would have
+    clamped some zones to a summer maximum for the entire horizon — silently.
+
+- **Great Britain: four defects, and each was masking the next.** GB projected at 9-13 EUR/MWh against a
+  market clearing near 80, and every layer had to come off before the one beneath was visible.
+  1. `gb_embedded` netted the WHOLE distribution-connected block off demand, making GB's net load equal
+     its metered generation plus imports BY CONSTRUCTION (leftover slack -15 MW on 2019, +77 on 2024) — so
+     the zone could always serve itself and priced at the bottom of its own stack. Split at
+     `must_run_share = 0.75`; see `io.gb_embedded` for the sourced-vs-fitted disagreement behind that.
+  2. The fleet was frozen at 1 January 2019 — twelve rows, reused for every year. `io.gb_capacity` walks
+     it on published dates: nuclear 9.23 -> 6.04 (2025) -> **2.83 (2030, four AGRs leave in one March)**
+     -> 6.46 (2037, Hinkley Point C + Sizewell C), coal 8.28 -> 0.
+  3. GB is wired to Norway and Ireland, neither a modelled zone: ~2.9 GW of import capability the model
+     could not represent. Added as `gas_import`, priced ABOVE Britain's own worst gas so it fires only
+     once the domestic stack is exhausted.
+  4. **The clamp was applied by TECH, so the two new blocks — tagged `gas` — were swept into a ceiling
+     measured from METERED gas generation**, which by construction cannot contain distribution-connected
+     engines or a Norwegian cable. 2900 MW of cable reached the solver as 1019. Retagged `gas_embedded`
+     and `gas_import`, which is what removed the VoLL hours.
+  - Gate: GB **2022 388.0 -> 237.4** (observed 233.1), **2024 196.1 -> 89.3** (84.6), 2025 147.9 -> 81.6
+    (93.4), and **86/60/37 VoLL hours -> 0**. Pooled |mean error| 13.1 -> **11.6**, scarcity recall
+    31891 -> **33996** of 34917.
+  - OPEN: 1508 modelled hours <= 0 in 2030 against 238 observed in the fitted year — the embedded-netting
+    signature the split reduced but did not remove.
+
+- **A zone can face its own CARBON price, not just its own gas hub** (`stacks.costs.carbon_adder_eur_t`,
+  applied in `commodities.model.zone_prices`): Britain levies Carbon Price Support on generation fuels on
+  top of its traded CO2 price — GBP 18/tCO2, frozen since April 2016, **abolished April 2026** so it is
+  not applied to the projection horizon. Worth +7.9 to +9.6 EUR/MWh on a CCGT.
+  - It explains only ~7 % of GB's price gap, and measuring that is the point: CPS bites only where gas is
+    MARGINAL, and gas was marginal in 28.2 % of modelled GB hours against **60.4 % observed**. The other
+    93 % was the marginality deficit, i.e. defects 1-4 above.
+  - It lives in `zone_prices` because that is the ONE function every solve path reaches for a zone's
+    prices. It was first written into `rolling.assemble._neighbour_inputs`, which the backtest does not
+    call (`rolling.windows.nb_window` does), so it silently did nothing — the same class of failure as
+    `ch_hydro`, `gb_embedded` and `_MIN_CELL`.
+
+- **Neighbour thermosensitivity EVOLVES** (`weather_shapes._thermo_coef`, `_thermo_growth`): a neighbour's
+  hourly demand is `_design(own temperature) @ load_coef * load_growth`, and `load_growth` is an ANNUAL
+  ENERGY ratio — it says nothing about how a zone responds to a heatwave. Multiplying the whole coefficient
+  vector by it froze each zone's revealed 2019 temperature response for the entire horizon, which is most
+  wrong exactly where air conditioning already dominates the summer peak: **IT-North fits +502 MW/degC on a
+  19.7 GW base (2.55 %) and Spain +381 on 28.6 GW (1.33 %)**. A 2050 Iberian heatwave was being served by a
+  2019 AC fleet. (The demand SHAPE was already own-weather driven — all eleven neighbours are fitted on
+  their own station data, none on the FR proxy — so it is the RESPONSE that was frozen, not the weather.)
+  - Cooling now rides AC penetration (workbook `ac_penetration_pct`, ratio to the anchor year) and heating
+    an electric-heating index (`heat_sensitivity_index`, already anchored at 1.0), mirroring the pattern
+    `demand_model.projection.drivers` has long used for France (`factor_base` / `factor_heat` /
+    `factor_cool`) rather than inventing a second idiom. Absent rows give 1.0, so the change is additive;
+    `DISPATCH_THERMO_EVOL=0` disables it, read at call time.
+  - **ENERGY IS PRESERVED ON THE CLIMATE NORMAL, NOT ON THE DRAW**, and that distinction is the design.
+    The scenario's `demand_twh` is the authority for the LEVEL, so re-scaling a coefficient must not move
+    the annual total; but renormalising against the DRAW would force every projected year to identical
+    annual energy and DELETE the weather signal — a hot year would stop consuming more, inverting the
+    purpose of the change. The correction is therefore computed against `design_mean`, the mean of each
+    design column over the fit-year weather. Measured: annual energy drift **0.000000 %** for all eleven
+    zones, while a uniformly hot draw gains materially. Pinned by
+    `test_reshaping_preserves_annual_energy_on_the_zone_climate_normal` and
+    `test_a_hot_year_still_consumes_more_and_by_more_than_before`.
+  - **A NEGATIVE COOLING COEFFICIENT IS FLOORED AT ZERO, NEVER GROWN.** GB fits a negative CDD term
+    (-509 MW/degC, -336 after the `_MIN_CELL` repair) which is not a cooling response at all but the
+    embedded-solar artifact. Scaling it by an AC growth factor would make British summer demand fall
+    FASTER every decade — the artifact compounding itself. NL (-1.7), AT_SI (-3.7) and DK (-10.1) are
+    floored on the same rule, which is also the honest reading: those zones have no measurable cooling
+    signal to grow.
+  - Sourced 2019 -> 2050 AC penetration: **ES 36 -> 66 %**, **IT-North 33 -> 75 %**, PT 15 -> 45,
+    AT_SI 10.9 -> 34.1, DE_LU 10 -> 30, BE 8 -> 30, NL 6 -> 28, CH 7 -> 25, PL_CZ 3.7 -> 27.7,
+    GB 2.5 -> 15, DK 1 -> 8. Anchors are IEA/JRC/national where available; FR (RTE's own 22 % in 2019 to
+    55 % in 2050) is carried for reference only, since France uses the full `demand_model` and is excluded
+    from this fit. CONFIDENCE IS UNEVEN and the biggest uncertainty is DEFINITIONAL — "AC penetration"
+    means fixed split systems, any device including portable monoblocks, or any reversible heat pump,
+    depending on the source; the broad definition is used throughout. DK is essentially unsourced (its
+    coefficient is floored anyway, so it does not bite) and IT-North's LEVEL is weak, being northern Italy
+    rather than the national figure. Resulting 2040 cooling factors: ES x1.60, IT-North x1.95, DE_LU x2.24.
+  - **NOT APPLIED: `heat_sensitivity_index` rows are absent by design.** The mechanism supports them, but
+    the researched heating trajectories (IT-North x11.5 and DE_LU x6.2 by 2050) are aggressive and their
+    verification pass did not complete. Heating stays on `load_growth` until those are checked.
+
   - **FIXED — AT_SI's fit-year anchor was AUSTRIA ONLY: Slovenia was absent from the lake before 2024.**
     `entsoe_load` and `entsoe_generation` both start **2024-01-01** for `SI`, while `AT` runs from 2019.
     `NeighbourWeatherModel.fit` sums the composite's constituents (`weather_shapes.py`, via
