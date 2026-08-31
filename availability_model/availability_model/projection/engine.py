@@ -125,7 +125,8 @@ def _assemble_draw(config, model, registry, draw, temp_daily, hstart, days, n_da
 
 
 def project(config: Config, n_draws: int | None = None, layer: str = "availability",
-            partitions: dict | None = None, draw_ids: list[int] | None = None):
+            partitions: dict | None = None, draw_ids: list[int] | None = None,
+            realization: int = 0):
     """Project availability. `layer`/`partitions` isolate a Monte-Carlo draw's output.
 
     A weather-Monte-Carlo re-runs this once per weather draw, and the default tables are SHARED — two
@@ -139,11 +140,19 @@ def project(config: Config, n_draws: int | None = None, layer: str = "availabili
     events in all N draws, with only the weather-COUPLED channels (thermal derating, reservoir wetness)
     varying. Measured on two draws: gas and reservoir availability came out bit-identical, nuclear differed
     only by derating. Passing `draw_ids=[d]` makes the outage realisation follow the weather draw, which
-    matters because nuclear outage variability is a first-order driver of French price spread."""
+    matters because nuclear outage variability is a first-order driver of French price spread.
+
+    `realization` picks the cube realization the WEATHER-coupled channels read, so a caller projecting on
+    weather draw N gets derating and wetness from draw N rather than from draw 0."""
     model = CalibratedAvailability.load(config.models_dir / "calibrated_availability.json")
     registry = load_scenario_registry(config)
     from ..io.weather import load_national_weather
-    temp_daily, wetness = load_national_weather(config)
+    # `realization` selects the weather draw the derating and wetness are computed FROM. It was hard-wired
+    # to 0, which is invisible on a single-realization cube and silently wrong on an ensemble one: the
+    # dispatch would take demand and RES from realization N while thermal derating and reservoir wetness
+    # came from realization 0 — the heat-wave coupling this model exists to carry, evaluated on a
+    # different summer.
+    temp_daily, wetness = load_national_weather(config, realization=int(realization))
     hstart, days, n_days = _horizon(config)
     nd = int(n_draws or config.section("projection")["n_draws"])
     ids = list(draw_ids) if draw_ids is not None else list(range(nd))

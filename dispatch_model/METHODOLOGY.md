@@ -176,6 +176,39 @@ arbitrage and coarse neighbour-hydro budgets are refinements.
     coefficient is an artifact of the same defect (ITSDO is net of embedded solar, so hot sunny hours read
     as low demand and the OLS books the anomaly against CDD), and removing more block at summer noon
     shrinks it by a third. It is smaller, not gone.
+- **A single projection now derives AVAILABILITY from the weather it is pricing** (`run_projection_20y`,
+  `_ensure_step_v_availability`): the runner took demand and RES from the weathergen cube but read plant
+  availability — nuclear thermal derating, reservoir wetness — from the SHARED step-v lake table, which had
+  been written five weeks before the cube it was being paired with (`availability` 2026-07-15 against a
+  cube regenerated 2026-08-20 for the neighbour-station extension). A hot summer in the draw being priced
+  therefore did not derate nuclear, because the derating had been computed on a different, and by then
+  non-existent, 42-station cube. `run_montecarlo` already did this correctly per draw; the single-run path
+  never did. Step v is now re-projected on the ambient cube into `availability_mc/wdraw=<draw>` before
+  `_preload`, resumable, `--refresh-avail` to force and `--no-avail-weather` to opt out.
+  - `availability_model.projection.engine.project` gained `realization`. It read the cube at ensemble
+    member 0 unconditionally — invisible on a single-member cube, and on an ensemble cube it would pin
+    derating and wetness to member 0 while demand and RES follow `--draw`, i.e. evaluate the heat-wave
+    coupling this model exists to carry on a DIFFERENT summer from the one being priced.
+  - KNOWN NARROWING: the re-projection asks for `n_draws=1, draw_ids=[draw]`, which is right for a Monte
+    Carlo (one outage realisation per weather realisation) but halves the nuclear outage sampling of a
+    single run — the shared table carried 2. The engine's own docstring calls nuclear outage variability a
+    first-order driver of French price spread, so a headline single run should widen it.
+
+- **The ensemble is built to be INTERRUPTED, so its completion markers are written last and atomically.**
+  An overnight schedule stops the Monte Carlo hard, once a night, for as many nights as it takes. Two
+  markers were unsafe under that:
+  - `prices_<y>.parquet` is what makes `run_projection_20y` skip a year, and it was written BEFORE
+    `dispatch_` and `flows_`. An interruption in that gap marked the year complete with its VOLUMES
+    missing — and the deliverables build needs those for revenues and congestion rents. Silently wrong,
+    not a crash. Now written LAST, after both.
+  - No write was atomic: killed mid-`to_parquet` leaves a truncated file that `exists()` returns True for,
+    so the year is skipped forever behind a corrupt marker. All three now go to a temp name and `os.replace`.
+  - A DRAW counted as complete once `projection_20y_analysis.xlsx` appeared, but its weather tab is
+    appended afterwards — an interruption between left a workbook that looked finished and could not have
+    its price path attributed to a winter. A `.draw_complete` file, written last, is now the marker.
+  Each window is ~1 second inside a ~20-minute year; across ~30 hard stops the chance of hitting one was
+  small but real, and the failure mode was a silently incomplete member of the ensemble.
+
 - **Revealed capability replaces the register in the PROJECTION** (`rolling.projection._scale_stack`,
   `neighbours.blocks.revealing_caps`): `participation_caps` clamps each thermal tech to the p99.9 of
   observed generation, because nameplate offers capacity that never bids — mothballed, strategic-reserve
@@ -223,8 +256,22 @@ arbitrage and coarse neighbour-hydro budgets are refinements.
   - Gate: GB **2022 388.0 -> 237.4** (observed 233.1), **2024 196.1 -> 89.3** (84.6), 2025 147.9 -> 81.6
     (93.4), and **86/60/37 VoLL hours -> 0**. Pooled |mean error| 13.1 -> **11.6**, scarcity recall
     31891 -> **33996** of 34917.
-  - OPEN: 1508 modelled hours <= 0 in 2030 against 238 observed in the fitted year — the embedded-netting
-    signature the split reduced but did not remove.
+  - `must_run_share` is **0.65**, the value the ECR/DUKES composition supports. It was 0.75 only because
+    the first sweep ran while both blocks were still tagged `gas` and were being clamped by
+    `participation_caps` to 35 % of their size; re-swept after the retag, every arm from 0.75 down to 0.45
+    has ZERO VoLL hours and a flat 1.10x dispersion, so the constraint that forced 0.75 was an artifact.
+    Source and fit now agree.
+  - **OPEN, and NOT the embedded share: GB is OVER-COUPLED to the continent.** Its modelled price exactly
+    equals a neighbour's in 34-45 % of hours (FR 40.7, NL 34.1, BE 44.6) against **0.1 % observed** — in
+    reality GB's price essentially never equals a neighbour's. GB is a separate synchronous area joined
+    only by HVDC: converter losses and finite day-ahead allocation stop it converging the way AC-coupled
+    continental zones do. Measured in GB's modelled <= 0 hours, GB sits 3.20 EUR/MWh BELOW its cheapest
+    neighbour where observed it sits 22.19 ABOVE (22.55 against 0.37), and 62 % of those hours have a
+    modelled neighbour also at <= 0, i.e. the surplus is imported rather than British.
+    That is what drives the residual cheap-hour overprint (2025: 822 modelled hours <= 0 against 238
+    observed), and the sweep proves the embedded share is not: moving it 0.75 -> 0.45 removes 98 excess
+    hours against 623 to close. The fix is HVDC losses and coupling friction in the flow formulation,
+    which changes every zone's exchange and belongs in its own change.
 
 - **A zone can face its own CARBON price, not just its own gas hub** (`stacks.costs.carbon_adder_eur_t`,
   applied in `commodities.model.zone_prices`): Britain levies Carbon Price Support on generation fuels on

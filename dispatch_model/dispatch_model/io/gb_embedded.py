@@ -200,27 +200,32 @@ def embedded_mw(config, year: int, index=None) -> pd.Series | None:
 #: entirely by which register is treated as the population. Three adversarial verifiers recommended 0.62,
 #: 0.70 and 0.90. Excluding the outlier the evidence clusters 0.62-0.70.
 #:
-#: THE 2025 PRICE FIT says 0.75, and it says so because 0.65 BREAKS THIS MODEL. Swept against observed GB
-#: 2025 (mean 93.4, median 95.7, sd 47.9, 238 hours <= 0):
+#: THE 2025 PRICE FIT AGREES, once it is measured on a model that is not broken. The FIRST sweep said 0.75,
+#: because 0.65 produced 4 VoLL hours and a dispersion of 6.81x — but that was an ARTIFACT. Both blocks
+#: were tagged `gas` at the time and were being swept into `participation_caps`, GB's ceiling measured on
+#: METERED gas generation, so they reached the solver at 35 % of their size. Re-swept after the retag to
+#: `gas_embedded` / `gas_import`, against observed GB 2025 (mean 93.4, median 95.7, sd 47.9, 238 hrs <= 0):
 #:
-#:     share   mean   median   hrs<=0   VoLL   sd/obs   MAE
-#:      1.00   53.4     49.6     2491      0    1.13x  44.8
-#:      0.85   56.9     61.4     2253      0    1.18x  42.5
-#:      0.75   59.6     70.4     2134      0    1.25x  41.5   <- MAE optimum, last arm that passes
-#:      0.65   68.9     74.7     2004      4    6.81x  47.2
-#:      0.55  101.6     79.2     1908     22   15.71x  76.1
-#:      0.45  130.9     81.0     1819     38   20.59x 102.1
+#:     share   mean   median   hrs<=0   VoLL   sd/obs   MAE   log_err
+#:      0.75   81.6     93.6      861      0    1.10x  27.28    1.277
+#:      0.65   83.0     93.7      822      0    1.10x  26.74    1.241   <- sourced value, and now free
+#:      0.55   84.4     93.7      796      0    1.10x  26.36    1.215
+#:      0.45   85.9     94.6      763      0    1.10x  26.09    1.191
 #:
-#: Below 0.75 the fleet starts withdrawing exactly when the system is tight — the same failure that got the
-#: fully-priced block rejected — and dispersion explodes past the markup panel's 2.0x gate. The level alone
-#: would prefer ~0.55 (mean 101.6 against 93.4 observed), but it buys that level with 22 VoLL hours GB has
-#: never had. 0.75 is where the level improves as far as it can WITHOUT reintroducing the pathology.
+#: EVERY arm now has zero VoLL and a flat 1.10x dispersion: the constraint that forced 0.75 is gone
+#: entirely. So the composition source and the price fit no longer disagree, and 0.65 is used because that
+#: is what the evidence says — ECR + DUKES across 14,552 records, with two of three adversarial verifiers
+#: at 0.62 and 0.70.
 #:
-#: THE DISAGREEMENT IS ITSELF A FINDING. The fleet's composition says 0.65 is right; this model cannot
-#: absorb 0.65 without running short. That points at GB's dispatchable stack being thin rather than at the
-#: ratio being wrong, and it is the next thing to look at. Until then GB stays too cheap — 59.6 against
-#: 93.4 observed on 2025, better than the 53.4 it was, and still 36 % low.
-_MUST_RUN_SHARE = 0.75
+#: THE REMAINING CHEAP-HOUR OVERPRINT IS NOT THIS PARAMETER, and the sweep is what proves it: swinging the
+#: share from 0.75 to 0.45 removes 98 excess zero hours against 623 to close. The cause is that GB is
+#: OVER-COUPLED to the continent. Its price exactly equals a neighbour's in 34-45 % of modelled hours
+#: against **0.1 % observed** — GB is a separate synchronous area joined only by HVDC, with converter
+#: losses and finite day-ahead allocation, and it does not converge the way AC-coupled continental zones
+#: do. In GB's modelled <= 0 hours it sits 3.20 EUR/MWh BELOW its cheapest neighbour; observed, in the same
+#: hours, it sits 22.19 ABOVE (22.55 against 0.37). Fixing that means HVDC losses and coupling friction in
+#: the flow formulation — a change to every zone's exchange, not a GB parameter. Logged, not bolted on here.
+_MUST_RUN_SHARE = 0.65
 
 #: Efficiency assigned to the priced tranche. Embedded reciprocating engines and diesel sets are small and
 #: inefficient, so the BOTTOM of the gas band is right; the band midpoint would price them as CCGTs.

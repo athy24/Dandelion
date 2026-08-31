@@ -52,9 +52,18 @@ def run_draw(draw: int, out_root: Path, master_seed: int, keep_cube: bool,
     from mc_weather import generate_cube, weather_summary
 
     ddir = out_root / f"draw_{draw:03d}"
-    if (ddir / "projection_20y_analysis.xlsx").exists():
+    # A `.draw_complete` marker, written LAST, is what says a draw is finished — not the workbook.
+    # `projection_20y_analysis.xlsx` is created by the deliverables step and only THEN gains its weather
+    # tab, so an interruption in between left a workbook that existed, counted as complete, and was
+    # missing the tab that lets a price path be attributed to a winter. The ensemble is built to be
+    # interrupted (an overnight schedule stops it hard once a night), so the marker has to be the last
+    # thing written, not the first artefact to appear.
+    if (ddir / ".draw_complete").exists():
         print(f"[mc] draw {draw}: already complete, skipping", flush=True)
         return
+    if (ddir / "projection_20y_analysis.xlsx").exists():
+        print(f"[mc] draw {draw}: workbook present but incomplete (interrupted) — redoing deliverables",
+              flush=True)
     print(f"[mc] draw {draw}: starting", flush=True)
     t0 = time.monotonic()
 
@@ -108,6 +117,7 @@ def run_draw(draw: int, out_root: Path, master_seed: int, keep_cube: bool,
         wb.move_sheet("Weather (this draw)", offset=-(len(wb.sheetnames) - 2))
         wb.save(xl)
 
+    (ddir / ".draw_complete").write_text("ok", encoding="utf-8")    # LAST: see the guard at the top
     if not keep_cube:
         cube.unlink(missing_ok=True)                                # 472 MB each; 50 of them is 23 GB
     print(f"[mc] draw {draw}: done in {(time.monotonic() - t0) / 60:.1f} min -> {ddir}", flush=True)
