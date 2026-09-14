@@ -1975,6 +1975,7 @@ The truncated-cube guard in `run_all.ps1` now recurses into the fingerprinted wo
 ### Left open, deliberately
 
 - **Nothing in the repository selects `REFERENCE_WEATHER_20Y`.** `build_reference_weather.py` reads a `ref_weather_map.json` that no committed script writes. Re-selecting it on the new ensemble needs that tool first.
+- **The old year map was moved aside, to `scratchpad/ref_weather_map_pre_wind100_723f1f75b645.json`.** It was selected on the pre-fix ensemble's prices. The builder's only check is that every draw the map names is complete under the current model, and once the new ensemble finishes, every draw it names will pass. The builder would then have stitched new-wind years onto an old-price selection without a warning. With the map moved, the builder stops on a missing file until a map is selected from the new ensemble.
 - **The golden baseline was recaptured**, after rebuilding the realization-0 projections from the default cube (backup `golden/baseline_pre_wind100_20260914.json.bak`). Five of fourteen artefacts moved, and not all of it is the wind:
   - the drivers and features also carried another cube's temperature (the realization-0 sharing above);
   - `res/production` had been frozen since 2026-07-15;
