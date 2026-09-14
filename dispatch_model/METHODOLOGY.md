@@ -418,7 +418,15 @@ LP's own balance rows, which is the check such a mistake cannot pass.
 
 `scripts/run_projection_20y.py` drives the horizon with this on and persists parquet per year;
 `scripts/build_projection_deliverables.py` turns that into revenue, congestion-rent and negative-hour
-tables. Congestion rent is `Σₕ flowₕ × (p_importing − p_exporting)`, which on SMC is non-negative by
+tables, and an hourly spot export per zone. The per-year parquets are indexed on the reference calendar
+(`projection._align` lays hour k of the target year onto hour k of the reference year), so the builder
+re-stamps each year onto its own calendar by the same offset from 1 January before joining them; a window
+dropped on the solve budget stays a gap, and the joined index is asserted strictly increasing. Until
+2026-09-14 it joined on the 2019 stamps and sorted, which interleaved the twenty years hour by hour in the
+hourly export while leaving every yearly table correct (DECISIONS.md). The builder cannot change a solved
+year, so it is not part of the solve fingerprint (`model_fingerprint.NON_SOLVE`); deliverables carry their
+own `.deliverables_fingerprint`, and `scripts/migrate_ensemble.py rebuild` re-formats stale ones without
+re-solving. Congestion rent is `Σₕ flowₕ × (p_importing − p_exporting)`, which on SMC is non-negative by
 construction — a useful self-check, since flow only ever runs cheap→dear in the LP. On post-markup spot it
 can go negative, and that count is reported rather than hidden: it measures how far the zone-by-zone markup
 moves zones relative to a coupling the LP had ordered the other way.
@@ -452,6 +460,50 @@ rates, and therefore RES revenue.
 simple re-pricing of the affected hours: at 180 the block sits BELOW gas (~201 €/MWh in 2046) rather than
 above it, so it displaces gas instead of being displaced by it and the marginal unit changes identity. That
 has to be measured, not extrapolated from the base run.
+
+## Sensitivity levers, and what a neighbour RES sensitivity can and cannot say (2026-09)
+
+The sensitivity set (`scripts/make_sensitivities.py`, `DECISIONS.md`) varies one assumption at a time on a
+fixed weather trajectory. Of its nineteen variants, fifteen are workbook cells; four are environment flags
+on two levers, because the cell that looks right is not read:
+
+- `DISPATCH_DEMAND_SCALE` — a multiplier on a zone's projected demand, applied in `rolling.projection`
+  after the weather shape. Two forms: flat (`FR=0.9,BE=1.05`) and a PATH, piecewise-linear in the year and
+  never extrapolated beyond its anchors (`FR=2027:1.0|2046:0.94`). Necessary because `dispatch_tyndp`'s
+  `demand_twh` IS read for France (`zfac("FR")`) and then never applied: with `weather_coherent: true` the
+  FR load is the step-iii projection. Editing that cell moves nothing while looking authoritative.
+  - The path form exists because a lower-demand scenario does not START lower. 2027 is all but built and
+    the divergence accumulates; a flat factor would cut the first projected year as hard as the last,
+    which is both a different scenario and a more violent one, since the near years carry the tightest
+    reserve margin. The ramp is taken off a least-squares TREND through the measured reference trajectory
+    rather than off the trajectory itself — the measured series carries the draw's weather (2036 sits above
+    2037), and a factor derived from it would scale that variation along with the level, giving a
+    lower-demand France a flatter response to a cold winter.
+- `DISPATCH_FR_NUC_AVAIL_SCALE` (0.99 = 1 % worse, RELATIVE) — multiplies the step-v availability
+  *fraction* in `rolling.fr_availability.nuclear_unavail_daily`, so the derate follows the maintenance
+  shape rather than adding flat outage MW. Availability comes from the lake, not from a cell.
+
+Both are read at call time and default to no change.
+
+**THE SCENARIO'S STATED FRENCH DEMAND IS NOT THE DEMAND THAT PRICES.** Measured on REFERENCE_WEATHER_20Y
+at realization 0, step iii projects 477 TWh in 2030, 511 in 2035, 543 in 2040 and 556 in 2046. The same
+workbook's `dispatch_tyndp` `demand_twh` row for FR states 540 / 616 / 680 and 740 at 2050 — PPE3-aligned
+figures, ~716 interpolated at 2046. The gap runs −63 / −105 / −137 / −160 TWh, and it has no effect on any
+price precisely because that row is inert for France. Anyone reading a French price out of this model is
+reading it off the lower path. Diagnosis is tracked separately; the demand sensitivities are therefore
+expressed as PROPORTIONAL cuts against the stated scenario, transposed onto the trajectory the engine
+actually produces, and their labels carry both numbers.
+
+**A neighbour RES sensitivity moves the LEVEL, not the MIX.** `NeighbourWeatherModel.shape` builds one
+aggregate must-take series per zone — the fitted response to that zone's own wind and clearness, re-anchored
+on `mean_sw_mw` and scaled by a single `res_growth`. That growth factor is the yield-weighted blend of
+`cap_solar_gw` and `cap_wind_gw` (`tyndp._RES_YIELD`, 0.12 and 0.28). So raising neighbour solar 10 %
+and raising neighbour wind 10 % both apply a UNIFORM uplift to the same series, differing only in size
+(DE_LU 2035: +4.0 % against +6.0 %). Neither tilts the profile toward midday or toward windy hours, which
+is precisely where a solar build-out and a wind build-out differ in their effect on prices. Read those two
+variants as "more neighbour renewables, by this much energy", not as "more solar" against "more wind".
+Separating them needs per-technology neighbour RES, which is the station-resolved neighbour build still
+open below.
 
 ## Remaining work
 

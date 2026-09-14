@@ -261,3 +261,36 @@ not "skipped" — docstring corrected, behaviour characterized as-is.
 - The five per-model `config.py` remain separate (assessed twice now: genuinely package-specific).
 - Neighbour weather models stay reduced-form and IT_NORTH markup R² is still negative — **modelling**
   backlog (documented in STEP_VII_METHODOLOGY.md), out of scope for a code review.
+
+## 13. Golden re-baseline — the 100 m wind refit, and two projections the baseline had never re-seen (2026-09-14)
+
+The gate went red when the wind100 refit regenerated `weathergen/output/simulation.nc`. It was re-captured after
+regenerating, from that cube, the realization-0 projections the harness freezes (`res-model project`,
+`demand-model project`). Backup: `golden/baseline_pre_wind100_20260914.json.bak`.
+
+Against that backup, 5 of 14 artefacts moved. Unchanged: availability ×4, both dispatch backtests,
+`res/hist_modelled_cf` and the two step-v reports. Not all of the delta is the wind; it is decomposed below as
+far as it was measured.
+
+| artefact | what moved | cause |
+|---|---|---|
+| cube `wind_speed_100m_ms` | mean 5.577 → 5.489, std 3.830 → 3.551 (all 76 stations); the seven other variables bit-identical | the refit (`weathergen/DECISIONS.md`, "wind100 diurnal shear") |
+| `res/proj_drivers`, `demand/projection_features` (realization 0) | `w100_nat` 5.669 → 5.566; `temp_nat` / `T_nat` 13.205 → 13.163 °C; CDD mean 0.331 → 0.271 | the refit, AND a different cube. Temperature is bit-identical between the pre-fix and refit cubes, so the old partitions were built from another one. Realization 0 was shared by the default cube, REFERENCE_WEATHER_20Y and Monte-Carlo draw 0 under an mtime-only freshness test, now replaced by `source_cube.json` (`dispatch_model/DECISIONS.md`, 2026-09-14) |
+| `res/production` (reference, realization 0) | PV total +14.7 %, onshore +9.9 %, offshore +1.6 %, national total +8.1 % | NOT the refit. The engine anchors each technology's CF mean, and the anchored onshore / offshore means are identical on the pre-fix and refit cubes (0.213 / 0.418). The frozen partition dated from 2026-07-15 and was never regenerated after later committed workbook and code changes. Not decomposed by commit |
+| `demand/projection_hourly` (reference) | load mean 71,143 → 58,725 MW (−17.5 %); 2027-2046 energy now 443.5 → 567.1 TWh | NOT the refit: the workbook. The baseline was captured in 96e40bd (2026-08-12) on the PPE3 demand tabs of 8be1a62. Commit aba6a5d (2026-08-20) then carried a growth moderation of `demand_macro`, `demand_mobility`, `demand_new_large_loads` and `demand_residential_tertiary` to 590 TWh in 2050: λ 0.456587 on GDP / industry / data centres / electrolysis, 0.518555 on heat pumps and EV fleets (`dispatch_model/scratchpad/solve_balanced.py`, 2026-08-17). Its commit message does not mention it |
+
+**Checking the demand attribution:**
+- **Tab hashes:** the four tabs' contents are identical from aba6a5d to the working tree and differ only between
+  aba6a5d~1 and aba6a5d.
+- **Recomputation:** a read-only recomputation of `deterministic_net` on today's features, swapping only those tabs:
+  - PPE3 tabs: 71,323.5 MW (the +0.25 % against the old golden is the weather);
+  - live tabs: 58,724.655 MW, exactly the regenerated partition;
+  - economic cut alone: −7,421 MW; electrification cut alone: −5,177 MW;
+  - 2046 energy: 760.0 TWh on the PPE3 tabs, against 567.1 TWh on the live ones.
+
+**Consequence for prices.** The Monte-Carlo reads the same tabs (`weather_shapes.fr_draw` → `project_trajectory`),
+so the old and new ensembles price the same moderated demand. Whether 590 TWh is the intended reference is a
+scenario question; it is not changed here.
+
+Gate at recapture: `tools/golden.py check` identical. Suites: powersim_core 29, weathergen 35, demand 24, res 30,
+availability 33, dispatch 380.

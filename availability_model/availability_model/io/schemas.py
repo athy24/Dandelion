@@ -39,7 +39,12 @@ FLEET_REGISTRY = DataFrameSchema(
         "name": Column(str, nullable=True, required=False),
         "technology": Column(str, nullable=False),          # nuclear/ccgt/ocgt/coal/oil/biomass/hydro_*
         "palier": Column(str, nullable=True, required=False),   # CP0/CPY/P4/P'4/N4/EPR (nuclear)
-        "capacity_mw": Column(float, Check.gt(0), nullable=False),
+        # UPPER BOUND, and it is not decoration. `Check.gt(0)` alone let the workbook sheet carry 32,470 MW
+        # for a 1310 MW reactor and 259 GW for a 63 GW French nuclear fleet, through every validation this
+        # project ever ran, into step v as the basis of every outage weight. No unit on this system is
+        # above ~1.8 GW (Flamanville 3 at 1.6 GW is the largest), so 2 GW is a generous ceiling that still
+        # catches an aggregate masquerading as a nameplate.
+        "capacity_mw": Column(float, Check.in_range(0, 2000, include_min=False), nullable=False),
         "cooling": Column(str, nullable=True, required=False),  # river/sea/tower/none
         "basin": Column(str, nullable=True, required=False),    # Rhône/Loire/Garonne/…
         "commissioning_year": Column("Int64", nullable=True, required=False),

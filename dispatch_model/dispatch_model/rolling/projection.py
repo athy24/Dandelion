@@ -26,20 +26,26 @@ from ..commodities.gas_rules import load_gas_rules
 from ..commodities.model import CommodityModel, load_zone_basis, zone_prices
 from ..commodities.resolve import PriceResolver
 from ..config import Config
+from ..hydro.water_value import season_of as wv_season_of
 from ..io.entsoe_hist import load_generation_hist
 from ..io.fr_history import load_fr_netload
+from ..lp.highs_solver import solve_budget
 from ..markup import apply_markup
 from ..neighbours.blocks import build_neighbour_stack, constituents, neighbour_netload
-from ..lp.highs_solver import solve_budget
 from ..res_schemes import load_res_schemes, solve_with_triggers
 from ..rules import rules_at
-from ..hydro.water_value import season_of as wv_season_of
 from ..scheme_evolution import scheme_shares, trigger_hours
 from ..stacks.costs import flex_vom
-from ..tyndp import (flex_capacity_mw, load_ntc_newbuild, load_tyndp, ntc_delta_mw, report_coverage,
-                     tyndp_factors)
-from .assemble import (_EXCLUDE_DISPATCH, MEASURED_MUSTRUN_ZONES, NTC, flow_derived_ntc,
-                       hourly_ntc, modelled_zones, slice_ntc)
+from ..tyndp import flex_capacity_mw, load_ntc_newbuild, load_tyndp, ntc_delta_mw, report_coverage, tyndp_factors
+from .assemble import (
+    _EXCLUDE_DISPATCH,
+    MEASURED_MUSTRUN_ZONES,
+    NTC,
+    flow_derived_ntc,
+    hourly_ntc,
+    modelled_zones,
+    slice_ntc,
+)
 from .windows import fr_stack_base, fr_window, nb_window
 
 # default structural CAGRs (editable — dispatch_projection tab). RES build-out dominates the negative-price
@@ -124,6 +130,60 @@ def _hydro_expander(ref: dict, target_year: int):
         return shift_hydro_bids(st, wbar * (lvl - 1.0), bid_col=_BID)
 
     return apply
+
+
+def _demand_scale(zone: str, year: int | None = None) -> float:
+    """Multiplier on a zone's projected demand, from `DISPATCH_DEMAND_SCALE`.
+
+    Two forms, both comma-separated across zones:
+
+        FR=0.9,BE=1.05                     flat — the same factor in every projected year
+        FR=2027:1.000|2035:0.972|2046:0.940   a PATH — piecewise-linear in the year, flat outside the ends
+
+    A demand SENSITIVITY, and deliberately not a workbook edit. With `weather_coherent` on, France's load
+    is the step-iii projection carried on the draw's weather — `demand_twh` in `dispatch_tyndp` is read
+    (`zfac`) but never applied to FR, so editing it moves nothing and would look like it had. The structural
+    tabs (`demand_macro`, `demand_mobility`, …) do drive step iii, but "FR demand 10 % lower" is not any one
+    of them: reproducing it there means choosing which of electrification, efficiency and datacentres gives
+    way, which is a different question from the one a demand sensitivity asks.
+
+    THE PATH FORM EXISTS BECAUSE "LOWER DEMAND" IS RARELY A STEP. A scenario that ends lower does not start
+    lower: 2027 is all but built, and the divergence accumulates. A flat factor would cut the first
+    projected year by as much as the last, which is a different scenario — and a more violent one, since the
+    near years are where the reserve margin is tightest. So the path ramps from 1.0 at the horizon's start to
+    the intended end-of-period ratio, and the annual energy it produces is what the variant is named for.
+
+    Absent, empty or 1.0 → no behaviour change. Read at call time, never cached at import: parallel variants
+    each set their own, and `project_year` is called once per year, so a path is re-read for every year.
+    """
+    raw = os.environ.get("DISPATCH_DEMAND_SCALE")
+    if not raw:
+        return 1.0
+    for item in raw.split(","):
+        z, _, v = item.partition("=")
+        v = v.strip()
+        if z.strip().upper() != zone.upper() or not v:
+            continue
+        if ":" not in v:
+            return float(v)
+        pts = []
+        for part in v.split("|"):
+            y, _, f = part.partition(":")
+            if y.strip() and f.strip():
+                pts.append((int(y), float(f)))
+        if not pts:
+            continue
+        pts.sort()
+        if year is None:
+            return pts[-1][1]                          # no year in hand → the end-of-period ratio
+        if year <= pts[0][0]:
+            return pts[0][1]
+        if year >= pts[-1][0]:
+            return pts[-1][1]                          # flat beyond the last anchor, never extrapolated
+        for (y0, f0), (y1, f1) in zip(pts, pts[1:]):
+            if y0 <= year <= y1:
+                return f0 if y1 == y0 else f0 + (f1 - f0) * (year - y0) / (y1 - y0)
+    return 1.0
 
 
 def _scale_stack(stack: pd.DataFrame, k: int, g: dict, cap_factors: dict | None = None,
@@ -321,6 +381,7 @@ def project_year(config: Config, target_year: int, ref, n_weeks: int | None = No
         fr = ref["fr"].copy()
         fr["demand_mw"] = fr["demand_mw"] * fr_dem
         fr["musttake_res_mw"] = fr["musttake_res_mw"] * fr_res
+    fr["demand_mw"] = fr["demand_mw"] * _demand_scale("FR", target_year)
     fr_stack = _append_flex(_scale_stack(ref["fr_stack"], k, g, cap_factors=fr_cap), "FR", tyndp, target_year)
     # water value — the projection was MISSING this: `run_backtest` expands the single `hydro_reservoir`
     # block into calibrated water-value tranches, `_preload` never did, so every projected year dispatched
@@ -633,7 +694,8 @@ def _preload(config: Config, ref_year: int, avail_years: list[int] | None = None
     # here as well would double-count (50.6 TWh at a 35.3 GW peak against a real ~21 TWh). The metered
     # series also carries the right peak — 13.04 GW vs this estimator's 22.28 — which is what the
     # projection's `res` factor then scales.
-    from ..io.unclassified_gen import enabled as _unclassified_on, solar_enabled as _uc_solar
+    from ..io.unclassified_gen import enabled as _unclassified_on
+    from ..io.unclassified_gen import solar_enabled as _uc_solar
     if "NL" in neigh and not (_unclassified_on() and _uc_solar()):
         try:
             from ..flexibility.res_potential import btm_solar

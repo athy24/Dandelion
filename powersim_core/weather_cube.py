@@ -191,3 +191,38 @@ def load_station_tidy(path, variables, realization: int = 0,
             block[v] = arr[:, j, vmap[v]] if v in vmap else np.nan
         frames.append(block)
     return pd.concat(frames, ignore_index=True), stations
+
+
+def cube_identity(path) -> dict:
+    """What a cache must remember to know it was built from THIS cube: resolved path, size, mtime (ns)."""
+    from pathlib import Path
+    p = Path(path).resolve()
+    st = p.stat()
+    return {"path": str(p), "size": int(st.st_size), "mtime_ns": int(st.st_mtime_ns)}
+
+
+def cache_is_fresh(cache_path, cube_path) -> bool:
+    """A lake cache is fresh only if its sidecar names the cube that will really be read now.
+
+    The previous test — cache newer than cube, keyed on the realization number alone — let three different cubes
+    that all use realization 0 (the default cube, REFERENCE_WEATHER_20Y, Monte-Carlo draw 0) hand each other
+    their drivers: whichever was written last looked fresh for the others, and the golden baseline captured a
+    mixture of two of them. Partitions written before the sidecar existed carry none and are rebuilt."""
+    import json
+    from pathlib import Path
+    cache_path, cube_path = Path(cache_path), Path(cube_path)
+    side = cache_path.with_name("source_cube.json")
+    if not (cache_path.exists() and cube_path.exists() and side.exists()):
+        return False
+    try:
+        return json.loads(side.read_text(encoding="utf-8")) == cube_identity(cube_path)
+    except Exception:                                                  # noqa: BLE001 - unreadable = not fresh
+        return False
+
+
+def record_cache_source(cache_path, cube_path) -> None:
+    """Write the sidecar that `cache_is_fresh` checks, next to the cache partition it describes."""
+    import json
+    from pathlib import Path
+    Path(cache_path).with_name("source_cube.json").write_text(json.dumps(cube_identity(cube_path)), encoding="utf-8")
+

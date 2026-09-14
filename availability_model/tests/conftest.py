@@ -8,6 +8,29 @@ import pytest
 from availability_model.config import load_config
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _isolate_lake(tmp_path_factory):
+    """No test may write the PRODUCTION lake, and one did.
+
+    `test_projection.py` calls `pipeline.project(cfg, n_draws=2)`, which defaults to `layer="availability"`
+    and writes it — so running the suite silently replaced the canonical availability tables that the
+    dispatch consumes and that `tools/golden.py` fingerprints. The canonical layer had no provenance at
+    all: it was whatever a two-draw test fixture last produced, on whatever cube happened to be
+    configured. Measured twice on 2026-09-09, mtimes moving at 09:44 and again at 10:12.
+
+    `lake.lake_root()` resolves `POWERSIM_LAKE` per call, so redirecting it for the session contains every
+    write this suite makes — not just the one that was noticed.
+    """
+    import os
+    root = tmp_path_factory.mktemp("lake")
+    old = os.environ.get("POWERSIM_LAKE")
+    os.environ["POWERSIM_LAKE"] = str(root)
+    yield root
+    os.environ.pop("POWERSIM_LAKE", None)
+    if old is not None:
+        os.environ["POWERSIM_LAKE"] = old
+
+
 @pytest.fixture(scope="session")
 def cfg():
     c = load_config("config.yaml")

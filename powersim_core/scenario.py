@@ -9,11 +9,14 @@ each model sees its historical sheet names unchanged.
 `snapshot()` freezes the workbook to immutable Parquet + a manifest (source hash + timestamp) for
 provenance — you can always tell exactly which assumption values produced a given run. Editing stays in
 the one xlsx; the snapshot is a code-side record, invisible to the editor.
+
+`POWERSIM_SCENARIOS` redirects that one file for a whole process — see `resolve()`.
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -28,6 +31,31 @@ def _sep(prefix: str) -> str:
     return f"{prefix}_"
 
 
+def resolve(path: str | Path) -> Path:
+    """The workbook actually read: `path`, unless `POWERSIM_SCENARIOS` names another file.
+
+    A SENSITIVITY is one changed assumption against an otherwise identical reference, and the four models
+    (iii demand, iv RES, v availability, vi/vii dispatch) each resolve `../scenarios.xlsx` from their own
+    config. Editing the shared file would make every concurrent run see the change and would leave no
+    reference to compare against; four config edits per variant would be four chances to move only three.
+    One environment variable moves all four at once, and only for the process that sets it — so variants
+    run side by side, each on its own workbook, with the reference file untouched.
+
+    Read at call time, never cached at import: the pool workers of `run_sensitivities.py` each set their
+    own value, and a module-level constant would freeze whichever variant imported first.
+
+    A named-but-missing file is an ERROR, never a silent fallback to the reference — a sensitivity that
+    quietly reruns the base case is indistinguishable from one that legitimately moved nothing.
+    """
+    override = os.environ.get("POWERSIM_SCENARIOS")
+    if not override:
+        return Path(path)
+    p = Path(override)
+    if not p.exists():
+        raise FileNotFoundError(f"POWERSIM_SCENARIOS={override} does not exist")
+    return p
+
+
 def load_model_sheets(path: str | Path, prefix: str) -> dict[str, pd.DataFrame]:
     """This model's tabs from the merged scenarios.xlsx, keyed with the `{prefix}_` stripped.
 
@@ -36,6 +64,7 @@ def load_model_sheets(path: str | Path, prefix: str) -> dict[str, pd.DataFrame]:
     an error (misconfiguration), not a silent all-tabs fallback.
     """
     pre = _sep(prefix)
+    path = resolve(path)
     xl = pd.read_excel(path, sheet_name=None)
     out = {name[len(pre):]: df for name, df in xl.items() if name.startswith(pre)}
     if out:
@@ -47,7 +76,7 @@ def load_model_sheets(path: str | Path, prefix: str) -> dict[str, pd.DataFrame]:
 
 def load_sheet(path: str | Path, prefix: str, sheet: str) -> pd.DataFrame:
     """One tab, addressed by (prefix, unprefixed sheet name)."""
-    return pd.read_excel(path, sheet_name=f"{_sep(prefix)}{sheet}")
+    return pd.read_excel(resolve(path), sheet_name=f"{_sep(prefix)}{sheet}")
 
 
 def file_sha256(path: str | Path) -> str:
@@ -59,7 +88,7 @@ def snapshot(path: str | Path, out_dir: str | Path | None = None) -> Path:
 
     Immutable provenance record under `data/lake/scenarios/<sha12>/`. Returns the manifest path.
     """
-    path = Path(path)
+    path = resolve(path)                                     # freeze what is READ, not what was asked for
     digest = file_sha256(path)
     out_dir = Path(out_dir) if out_dir else (lake.lake_root() / "scenarios" / digest[:12])
     out_dir.mkdir(parents=True, exist_ok=True)

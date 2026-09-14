@@ -18,6 +18,17 @@ Two price series run through every table, and the distinction matters:
 Volumes come from the LP primal (`DISPATCH_CAPTURE_DISPATCH`), so revenue is generation x price hour by
 hour, not an annual average times an annual volume — the difference is the capture-rate effect, which for
 solar and wind is the entire economic question.
+
+**Each year is re-stamped on its own calendar before the years are joined.** The solve runs on the reference
+calendar: `projection._align` lays hour k of the target year's weather onto hour k of the reference year, so
+every per-year parquet carries reference-year timestamps. Joining those and calling `sort_index()` — as this
+script did until 2026-09-14 — interleaved the twenty years hour by hour (174,624 rows, all stamped 2019, FR
+jumping 110 -> 2 -> 105 within one timestamp) while every yearly table, computed before the join, stayed right.
+`to_target_calendar` inverts the offset instead; the joined index is asserted strictly increasing.
+
+The output directory is stamped `.deliverables_fingerprint` (the builder's own digest), written LAST. The
+builder is not part of the solve digest (`model_fingerprint.NON_SOLVE`): it cannot change a solved year, so a
+fix here re-formats deliverables (`migrate_ensemble.py rebuild`) instead of re-solving an ensemble.
 """
 from __future__ import annotations
 
@@ -29,6 +40,8 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+STAMP = ".deliverables_fingerprint"
 
 # pseudo-columns that are not generation technologies
 _SYSTEM = ("ens", "dump")
@@ -50,6 +63,21 @@ def _load_year(src: Path, y: int):
         fl = fl.pivot_table(index="time", columns="border", values="flow_mw", aggfunc="sum") \
                .reindex(smc.index)
     return smc, spot, d, fl
+
+
+def to_target_calendar(index: pd.DatetimeIndex, target_year: int) -> pd.DatetimeIndex:
+    """Re-stamp a solved year from the reference calendar onto its own.
+
+    `projection._align` maps hour k of the target year to hour k of the reference year, so the inverse is the
+    same offset from 1 January. That keeps a leap day where the target year has one, and leaves the hours of a
+    window dropped on the solve budget out rather than sliding the rest of the year onto them. An index already
+    on the target calendar maps onto itself."""
+    ref_years = pd.unique(index.year)
+    if len(ref_years) != 1:
+        raise ValueError(f"expected one calendar year in a per-year index, got {list(ref_years)}")
+    ref0 = pd.Timestamp(f"{int(ref_years[0])}-01-01", tz=index.tz)
+    tgt0 = pd.Timestamp(f"{int(target_year)}-01-01", tz=index.tz)
+    return (index - ref0) + tgt0
 
 
 def revenues(y, smc, spot, d) -> pd.DataFrame:
@@ -155,6 +183,10 @@ _NOTICE = [
     ("PriceModeling — step vi/vii, 20-year projected dispatch", ""),
     ("", ""),
     ("Horizon", "2027-2046, one weather realization (draw 0), 12 modelled bidding zones."),
+    ("Hourly timestamps", "Each year is stamped on its OWN calendar (UTC, no DST shift). The solve runs on the "
+                          "2019 reference calendar with the target year's weather laid on it by position, so hour "
+                          "k here is hour k from 1 January of that year. A window dropped on the solve budget leaves "
+                          "a gap; a final year shorter than 52 weeks ends where the weather cube ends."),
     ("Scenario", "scenarios.xlsx, 'reference'. Reference year 2019 supplies the window calendar, "
                  "the firm-stack base, the NTC structure and the hydro/must-run curves."),
     ("Weather", "FR demand and RES come from the step-iii/iv engines on a weathergen realization; "
@@ -264,6 +296,7 @@ def main() -> int:
 
     src, out = Path(args.src), Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    (out / STAMP).unlink(missing_ok=True)                   # stale until this run finishes; written LAST
     years = sorted(int(p.stem.split("_")[1]) for p in src.glob("prices_*.parquet"))
     if not years:
         print(f"no prices_*.parquet in {src}", file=sys.stderr)
@@ -278,6 +311,7 @@ def main() -> int:
         smc, spot, d, fl = _load_year(src, y)
         s = spot.copy()
         s.insert(0, "FR_SMC", smc["FR"])
+        s.index = to_target_calendar(s.index, y)             # see the module docstring: never join on 2019 stamps
         spot_all.append(s)
         psum.append(price_summary(y, smc, spot))
         neg.append(negative_hours(y, smc, spot))
@@ -289,7 +323,11 @@ def main() -> int:
         prog.update(note=str(y))
 
     prog.close()
-    prices = pd.concat(spot_all).sort_index()
+    # years were appended in order, each on its own calendar, so the join IS the time series. No sort: it is not
+    # needed, and pandas' default sort is not stable, which is part of how the interleaving went unnoticed.
+    prices = pd.concat(spot_all)
+    if not (prices.index.is_monotonic_increasing and prices.index.is_unique):
+        raise AssertionError("hourly export is not strictly increasing after re-stamping - calendar mapping broken")
     prices.index.name = "timestamp_utc"
     cols = [args.hub] + [c for c in prices.columns if c not in (args.hub, "FR_SMC")] + ["FR_SMC"]
     prices = prices[cols].round(2)
@@ -350,6 +388,8 @@ def main() -> int:
         prices.to_excel(xl, sheet_name="Hourly spot")
     _style(f1)
     print(f"[deliverables] wrote {f1}  ({len(prices):,} hours x {prices.shape[1]} columns)", flush=True)
+    import hashlib
+    (out / STAMP).write_text(hashlib.sha256(Path(__file__).resolve().read_bytes()).hexdigest()[:12], encoding="utf-8")
     return 0
 
 

@@ -273,6 +273,50 @@ vs hist +0.48, from the wind100 residual, + changed load composition). True proj
 model's 60 h-smoothed temp + residual). weathergen backups: fitted_pre_seasonal.pkl.bak,
 simulation_pre_seasonal.nc.bak.
 
+## Hub-height wind: weathergen refit, and what it changes in step iv (2026-09-14)
+
+**The defect.** The co-generated `wind_speed_100m_ms` this model reads peaked at 13-14 UTC, following the 10 m
+wind. ERA5 100 m wind peaks at 20 UTC, and RTE onshore production at 21 UTC. The cause was a transfer with no hour
+term; cause and repair are in `weathergen/DECISIONS.md` ("wind100 diurnal shear").
+
+**The repair.** The transfer was refit, with a national common factor restoring the variance the SYNOP-fitted
+residual lacked, and the default cube was regenerated.
+
+**How it was measured.** This model's calibrated onshore and offshore conversions, with the engine's level anchor,
+driven by the national mean of the 42 French stations. Observed = RTE production 2019-2025, each profile
+normalised by its mean.
+
+| onshore | peak | first-harmonic phase | energy share 10-15 UTC | 17-22 UTC | profile corr vs observed |
+|---|---|---|---|---|---|
+| observed | 21 UTC | 20.2 h | 0.246 | 0.264 | — |
+| pre-fix cube | 14 UTC | 13.7 h | 0.290 | 0.244 | −0.10 |
+| refit cube | 20 UTC | 20.2 h | 0.241 | 0.268 | 0.94 |
+
+Offshore: phase 13.7 h → 21.0 h, against 21.6 h observed; profile corr −0.51 → 0.91.
+
+Against the same conversion driven by ERA5 100 m wind at the same 42 stations (2015-2026, hourly onshore CF):
+
+| onshore CF | std | p05 | p50 | p95 | p99 | DJF std | DJF p95 | daily-mean std | hour-to-hour step std |
+|---|---|---|---|---|---|---|---|---|---|
+| ERA5-driven | 0.162 | 0.043 | 0.162 | 0.567 | 0.727 | 0.193 | 0.680 | 0.150 | 0.018 |
+| pre-fix cube | 0.153 | 0.046 | 0.169 | 0.539 | 0.693 | 0.170 | 0.607 | 0.114 | 0.065 |
+| refit cube | 0.163 | 0.041 | 0.163 | 0.568 | 0.724 | 0.187 | 0.670 | 0.143 | 0.043 |
+
+**The pre-fix cube's tail.** It compressed the upper tail where it matters most for prices: winter p95 0.607
+against 0.680, and day-to-day swings 24 % too mild.
+
+**The refit cube.** It is within 0.01 on every quantile and within 5 % on the daily-mean std. One gap remains:
+hour-to-hour steps are 2.4x ERA5's (3.6x before). Ramps inside a day are overstated, while their daily and
+seasonal envelope is right.
+
+**What this model does not change.**
+- **Code and calibration:** unchanged. The calibration runs on ERA5 history, not on the cube.
+- **Projected CF levels:** anchored as before. What changes is the diurnal shape, the winter upper tail and the
+  evening share.
+- **Stale partitions:** every lake partition built from a pre-fix cube (`res/proj_drivers`, `res/production`)
+  is stale. Partitions now record their source cube in `source_cube.json` and rebuild when it differs
+  (`powersim_core/weather_cube.py`).
+
 ## Build plan (phase-by-phase, sign-off between each)
 
 0 scaffold ✓ · 1 io loaders + QC + ERA5 · 2 transfer (station→ERA5-100 m, GHI) · 3 conversion chains

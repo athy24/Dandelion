@@ -1385,6 +1385,14 @@ consumer is redirected at it by ONE env var:
 * Draw *d* runs step v on its own cube into lake layer `availability_mc`, partition `wdraw=d`, selected by
   `DISPATCH_AVAIL_WDRAW`. The canonical `availability` layer is never touched, so the single-run path is
   unchanged. Confirmed in the parallel smoke: each worker reports "1 nuclear draw(s)", not the shared 2.
+  **THAT SENTENCE DOCUMENTED THE BUG AS PROOF OF HEALTH (corrected 2026-09-09).** "1 nuclear draw(s)" was
+  the precise condition under which the lookup could not work: `nuclear_unavail_daily` asked for
+  `frac.loc[(draw % nuc_draws, year)]`, and with one draw in the partition `draw % 1 == 0` for every
+  caller, so it could only ever hit a partition whose single label was 0. Each `wdraw=d` is written with
+  `draw_ids=[d]`, so the label is `d` and the lookup raised KeyError, returned None, and `fr_window`
+  silently substituted the 2019 rolling-max proxy. Forty-nine of the fifty draws were priced on one
+  identical 2019 nuclear shape; the ensemble had no nuclear-availability dimension at all. See the
+  2026-09-09 entry below.
 * The dispatch runs with `--draw d`, which keys the demand/RES driver caches (`realization=d`). Passing 0
   for every draw would make them share one cache entry and hand draw *d+1* the drivers of draw *d*
   whenever its cube predates that cache.
@@ -1411,3 +1419,566 @@ markup are identical across draws. It is weather risk, not scenario risk, and th
 
 Validated end to end on two truncated draws: FR annual means differ by 32.5 €/MWh on average (inflated by
 the truncation), HDD 1721 vs 1519, and each draw carries its own weather as a workbook tab.
+
+## One central weather trajectory, and a sensitivity set that varies one assumption at a time (2026-09)
+
+The 50-draw ensemble spans weather and nothing else — the notice in `mc50_consolidated.xlsx` says so
+explicitly. The questions that follow it are all structural: what if carbon settles at 175 rather than
+197.5, what if French solar under-builds by a fifth, what if the reactors are not extended past sixty
+years. Those cannot be read off the ensemble, because in the ensemble every draw carries the same
+assumptions.
+
+A sensitivity therefore needs the opposite discipline from an ensemble: hold the weather **fixed** and move
+one assumption, so the difference in the answer is the assumption. That requires a weather trajectory to
+hold fixed, and it should not be an arbitrary draw.
+
+### REFERENCE_WEATHER_20Y — the most typical year, twenty times
+
+For each projected year the ensemble gives 50 French annual mean spot prices. Take, per year, the draw
+whose price sits closest to the ensemble mean, and take that draw's weather **for that year**. Twenty
+years, sixteen distinct draws, worst deviation 0.467 €/MWh and most under 0.10 — so every year of this
+trajectory prices at essentially the ensemble mean for that year, which no single draw does (draw 0, for
+one, is a low outlier in half the horizon).
+
+The cubes had been deleted after each draw, 854 MB apiece. `generate_cube` seeds
+`SeedSequence([master_seed, draw])`, so the sixteen needed were regenerated exactly, one at a time, and
+deleted again once their year had been copied out — 852 MB of assembled output through a disk memmap,
+because the machine has about 2 GB free and the array is 852 MB.
+
+**The seam is real and is corrected to first order.** Consecutive years come from different simulations, so
+31 December and 1 January are unrelated draws. Per station and variable the step is halved into each side
+and tapered linearly to zero over 72 hours; bounded variables are re-clipped afterwards. What that removes
+is the discontinuity, not the independence: a storm that ends where a calm begins still ends there.
+
+**What this trajectory is not.** It is not a physically sampled twenty-year sequence. Year-to-year
+persistence — a dry winter after a dry autumn, reservoir carry-over across a New Year — is broken by
+construction. Anything that depends on multi-year weather memory must be read from the ensemble.
+
+### `POWERSIM_SCENARIOS` — one switch for four models
+
+Four configs name `../scenarios.xlsx` (demand, RES, availability, dispatch) and every one of them reads it
+through `powersim_core.scenario`. So the redirect goes there, in `resolve()`, and one environment variable
+moves all four at once — for the process that sets it and no other, which is what lets three variants run
+side by side on three different workbooks with the reference file untouched. Read at call time, never
+cached at import, for the same reason every other flag in this repo is: a module-level constant would
+freeze whichever variant imported first.
+
+A named-but-missing file raises. A sensitivity that quietly reruns the base case is indistinguishable from
+one that legitimately moved nothing, and that is the worst failure this set can have.
+
+### Where the line falls between a cell and a flag
+
+Fifteen of the nineteen sensitivities are workbook edits, each on exactly one tab (verified by diffing
+every variant against the reference: one tab changed, all others byte-identical). Four are not, and the
+reason is that the cell that looks right is not read:
+
+* **FR demand.** `dispatch_tyndp` carries `demand_twh` for France, `zfac("FR")` reads it — and with
+  `weather_coherent: true` it is never applied, because FR load is the step-iii projection carried on the
+  draw's weather. Editing that cell moves nothing while looking authoritative. `DISPATCH_DEMAND_SCALE`
+  scales the projected load instead. The structural tabs *do* drive step iii, but "FR demand 10 % lower"
+  is not any one of them — reproducing it there means choosing which of electrification, efficiency and
+  datacentres gives way, which is a different question.
+* **FR nuclear availability.** It comes from the step-v lake, not from a cell. `DISPATCH_FR_NUC_AVAIL_SCALE`
+  multiplies the availability *fraction*, so the derate follows the shape: a fleet already 40 % out for
+  maintenance in May loses less absolute MW than one at full availability in January, which is how a worse
+  forced-outage rate actually falls. Relative, not percentage points — the same reading as "solar −10 %".
+
+### The French demand sensitivities, and the 160 TWh that made them proportional
+
+The request was "demand rising to only 700 TWh by end of period instead of 740-750". Measuring first turned
+that premise over. Step iii, on REFERENCE_WEATHER_20Y at realization 0, projects **556 TWh in 2046** — not
+740. The workbook's own `dispatch_tyndp` `demand_twh` row for FR does say 540 / 616 / 680 / 740 at
+2030 / 2035 / 2040 / 2050, but that row is read for France and never applied, so the scenario's stated
+demand has never touched a French price. The engine's path is the one that prices, and it runs
+−63 / −105 / −137 / −160 TWh under the scenario the workbook asserts. The demand tabs are byte-identical to
+git HEAD, so this is not a stray edit; it is how the model has been pricing all along, including through the
+50-draw ensemble. Diagnosis is a separate piece of work.
+
+**Diagnosed on 2026-09-14**, surfaced by the golden recapture (`REVIEW.md` §13). The gap is the workbook, not the
+engine.
+- **The commit:** aba6a5d (2026-08-20), whose message is about LP volumes and flexibility, carried a growth
+  moderation of four demand tabs: `demand_macro`, `demand_mobility`, `demand_new_large_loads` and
+  `demand_residential_tertiary`.
+- **How it was made:** `dispatch_model/scratchpad/solve_balanced.py` solved it on 2026-08-17 to reach 590 TWh in
+  2050. Each driver's growth from its 2025 value is scaled by a factor λ:
+  - λ = 0.456587 for GDP, steel, chemicals, cement, data centres and electrolysis, set for GDP +1.1 %/yr;
+  - λ = 0.518555 for heat pumps and the EV fleets.
+- **Where it shows:** those four tabs changed in aba6a5d and are identical from there to the working tree. On the
+  12 August tabs (8be1a62, PPE3) the same engine gives 760 TWh in 2046, against 567 on today's.
+
+So "how the model has been pricing all along" means since 20 August, and the choice is only now documented.
+Whether 590 TWh is the intended reference is a scenario decision; it is not changed here.
+
+Against 556, an absolute 700 TWh target would have been a **26 % increase** — the opposite sign of the
+sensitivity asked for. So the two variants are built as the PROPORTIONAL cuts that 700 and 650 represent
+against the 745 the request was framed on (0.940 and 0.873), transposed onto the measured path: 523 and
+485 TWh in 2046, with growth held to 69 % and 34 % of the reference's. Both labels carry both numbers,
+because a variant called "700 TWh" that lands at 523 would be the same class of quiet lie this whole set
+exists to avoid.
+
+The third demand variant needed no such transposition, because it names a physical quantity rather than a
+total: electrolysis capacity frozen at 2.0 GW from 2030 instead of 2.3 rising to 4.8. The capacity is
+frozen and the load factor is not — a stalled build-out says nothing about how hard the units that were
+built are run — so the frozen fleet still consumes more each year. Measured end to end at the demand level,
+the workbook edit propagates exactly: −1.1 TWh in 2030, −8.1 in 2035, −14.4 in 2046, matching
+capacity × load-factor × 8760 in every year of the horizon.
+
+Two conventions are choices, not deductions, and are stated as such in `make_sensitivities.py`: commodity
+sensitivities move the **long-run anchors only** (≥ 2031; 2027-2030 are quoted forwards, so "CO₂ 175"
+means the 197.5 €/t plateau becomes 175 with the interpolation from 2030 following), and RES capacity moves
+the **projected years only** (≥ 2027; 2025-2026 are built or building and sit outside the horizon).
+
+One sensitivity cannot be run as named. "Non-FR onshore wind +10 %" has no onshore/offshore split to move:
+the neighbour model carries a single `cap_wind_gw` aggregate, so `s16` is +10 % on all neighbour wind, and
+the manifest says so.
+
+### What is shared, and why it is computed before any variant starts
+
+Three artefacts are weather-only and cost minutes each: `demand/projection_features`, `res/proj_drivers`
+(both keyed by realization, both invalidated by the cube's mtime) and the step-v availability partition.
+Computed inside the variants they would be computed by three workers at once on the same lake path, and
+recomputed by every variant that started before the first finished. The runner computes them once, alone,
+before any variant starts; the variants only read.
+
+The availability partition is `availability_mc/wdraw=900`, deliberately outside the archived ensemble's
+0-49. The sensitivities are not draw 0 of anything, and writing over that partition would silently
+redefine an archived result. Setting `DISPATCH_AVAIL_WDRAW` before the runner starts also makes
+`run_projection_20y` skip its own step-v block — the same deference that makes it a no-op under
+`run_montecarlo`.
+
+### Resumability, because this is designed to be killed every morning
+
+Two levels, the same as the ensemble: a variant whose `.sens_complete` marker exists is skipped whole, and
+inside a variant any year whose `prices_<y>.parquet` exists is skipped — that file is written LAST and
+atomically, so its presence means the year's dispatch and flows landed too. `sens_night.ps1` carries every
+defence `mc_night.ps1` earned: kill the process **tree** before the task's own limit fires (an execution
+limit kills the wrapper and leaves the pool workers orphaned, which cost a full night at 35.6 GB of commit
+against 15.7 GB of RAM), a deadline strictly ahead of now (a catch-up at 09:26 once resolved its deadline
+to that same morning and killed the run in the same second), and no daytime catch-up at all.
+
+## Le nucléaire français n'a jamais varié d'un tirage à l'autre : quatre défauts empilés dans la chaîne de disponibilité (2026-09)
+
+The 50-draw ensemble was built to span weather risk. It also claimed to span nuclear availability — each
+draw projecting step v onto its own weather. It did not. Forty-nine of the fifty draws were priced on one
+identical 2019 nuclear shape, and the four defects that made that possible had all been reported as working.
+
+### D1 — a count used as an identifier, failing silently into a proxy
+
+`nuclear_unavail_daily` resolved the draw as `frac.loc[(draw % nuc_draws, target_year)]`. `nuc_draws` is a
+COUNT; the index carries IDENTIFIERS. Every `availability_mc/wdraw=d` is written by
+`project(n_draws=1, draw_ids=[d])`, so it holds one series labelled `d` and `nuc_draws == 1` — making
+`draw % nuc_draws` the constant 0 for every caller. The lookup could only ever hit a partition whose single
+label happened to be 0. Everywhere else it raised `KeyError`, returned `None`, and `fr_window` substituted
+the reference-year rolling-max-of-output proxy without a word.
+
+Only draw 0 resolved, and only by coincidence. It sits **11.53 €/MWh below the ensemble mean** (mean z
+−2.27, rank 1 of 50 in eleven of twenty years) — an anomaly noted weeks earlier as "a low outlier with no
+weather explanation". This was the explanation.
+
+**Four layers of silence stacked**, and the runs printed reassurance throughout: `run_projection_20y` said
+"reusing availability_mc/wdraw=13" (true — the partition existed), `_preload` said "1 nuclear draw(s)"
+(true — and precisely the condition that broke the lookup), and this file recorded that second line as
+positive evidence of correctness. Labels are now resolved against what the partition carries, and both the
+applied path and the fallback announce themselves.
+
+### D2 — a ratio whose denominator was its own numerator
+
+The availability fraction was `available_mw / available_mw.groupby(draw, year).max()`. The best day of a
+year is never a full-availability day, so the fraction sat **6.8 points high — about 4.3 GW of French
+nuclear never removed from the dispatch stack, every hour of every year**. The tell was 2027, whose bias
+was only 1.05 points against 6.5–8.0 everywhere else: `_assemble_draw` seeds every unit at full capacity
+before applying outages, so year one's maximum does reach true installed. The justification recorded for
+the maximum — "captures a fleet that shrinks as reactors retire" — did not hold either, since
+`closure_year` was NaN for all 168 registry rows and nothing ever retired.
+
+Step v now writes `installed_mw` beside `available_mw`, both from one `_operating_mask`, so numerator and
+denominator cannot describe different fleets. A partition without the column is refused, not silently
+degraded.
+
+### D3 — a column named capacity that was not capacity
+
+`avail_fleet_registry` carried 259 GW of French nuclear against a real ~63 GW, and the error was per-unit,
+not a scale: Cattenom 1 at 32 470 MW for a 1310 MW reactor (12.5 % of fleet weight against a true 2.1 %),
+while Penly 1, Civaux 1, Golfech 1 and Flamanville 3 were exactly right. A column correct for some rows and
+24× wrong for others is a SUM OVER AN OBSERVED SERIES, not a nameplate. Since `_assemble_draw` seeds each
+unit at `capacity_mw`, outage weight was misattributed across the fleet — Herfindahl effective unit count
+31.1 against 59 reactors.
+
+`gen_nuclear_trajectory.py` had documented this in August ("the registry's own `capacity_mw` column is not
+capacity … so only the years are taken from it") and worked around it locally, without anyone propagating
+the finding to step v, which consumes it as the basis of every outage.
+
+The sheet is regenerated wholesale from `io/fleet.py::build_fleet_registry`, which was correct all along —
+same 168 unit_ids in the same order, nuclear 65.76 GW, largest unit 1596 MW, and `closure_year` 2020 for
+Fessenheim 1/2 where the workbook had it null for every row. `FLEET_REGISTRY` gained a 2 GW ceiling;
+`Check.gt(0)` alone had let 32 470 MW validate for the project's whole life.
+
+### D4 — a fleet that began life on the first day of the projection
+
+Refuelling was scheduled from the horizon start, each unit's first outage drawn uniformly in
+`[hstart, hstart + cycle)`, so on 1 January of year one **no reactor was mid-outage**. Measured across every
+partition, year one ran 0.8 % to 9.7 % more available than that draw's own remaining nineteen years — about
+3.8 GW of phantom nuclear in the highest-priced year of the horizon. It never reached a price before,
+because year one was on the proxy in 49 of 50 draws; after D1 it would have. Scheduling now starts three
+years before the horizon and is clipped to it, leaving units mid-cycle on day one in the proportion the
+cycle implies. Year one's excess: **+8.5 % → +0.7 %**.
+
+### The same defect shape, five more times
+
+D3's retirement schedule exposed a family: `planned_scheduler` and `forced.py` both excluded units on
+`closure_year.notna()` rather than "closed before the horizon", so the moment retirements existed,
+twenty-two reactors silently stopped refuelling (fleet availability jumped 0.744 → 0.80) and would have
+lost forced outages entirely. Three Kd diagnostics divided by a denominator that dropped the retiring
+fleet, reporting **Kd 0.900 for a fleet running at 0.747**. All now use the operating window.
+
+### Step v and the dispatch now price the same fleet
+
+Step v modelled 59 reactors that never retire and never gain a sibling — `installed_mw` flat at 64 009 MW —
+while the dispatch scaled `cap_nuclear_gw` to 56.5 GW by 2045 and folded in ~10 GW of EPR2. D2 amplified
+that mismatch: the fraction fell 0.823 → 0.744, so the absolute outage MW carried onto the dispatch's fleet
+grew about 45 %. The registry now carries the dispatch's own `glide_closures` retirements and the six EPR2
+units, and the two fleets track to within 2 % across the horizon.
+
+**The new units get their own outage rate, from physics rather than assertion.** Forced-outage age creep
+accrued as `y - ref_year` — with the calendar, so every reactor aged from the same instant regardless of
+when it was built, and a 2038 EPR2 carried ~25 years of creep by 2046 having run for eight. It now accrues
+from each unit's own commissioning against the age the calibrated fleet had when calibrated. Planned
+outages use palier `EPR`, Flamanville 3's class, calibrated at an 18.0-month cycle against 12.0–17.0 for
+the legacy paliers. Measured over 2038–2046 on operating units: **EPR2 0.782, existing fleet 0.739**.
+
+### What it costs, measured end to end
+
+A full 20-year run on REFERENCE_WEATHER_20Y, step-v availability applied in 20 of 20 years with zero
+fallbacks: FR mean **65.5 €/MWh** against the old ensemble's 63.4, i.e. **+2.1** — but that mean hides the
+shape. By period: **−3.5 / −2.9 / +2.6 / +13.1** €/MWh for 2027-30 / 2031-35 / 2036-42 / 2043-46. The 2019
+proxy was a fixed MW envelope divided by a shrinking `nuc_cap`, so its implied fraction climbed mechanically
+towards 1.0 in the late horizon while the true fraction stays near 0.74. The repair also moves the model
+toward the record: observed ex-crisis Kd 0.738, model was 0.765, now 0.748.
+
+**The backtest gate is untouched.** `run_backtest` builds FR nuclear outage from REMIT, and the only step-v
+consumer in the repo is `rolling/projection.py`. No backtest needed re-running.
+
+### And a test was the producer of a production artefact
+
+`availability_model/tests/test_projection.py` called `project(cfg, n_draws=2)`, which defaults to
+`layer="availability"` — so running the suite rewrote the canonical availability tables the dispatch
+consumes and `tools/golden.py` fingerprints. The layer had no provenance: it was whatever a two-draw test
+fixture last wrote, on whatever cube happened to be configured. The suite is now isolated behind a session
+`POWERSIM_LAKE` redirect, and the canonical layer is produced only by
+`availability_model/scripts/project_canonical.py`, which stamps a `PROVENANCE.json` naming the cube, the
+realization, the registry digest and the commit.
+
+## Un nom de répertoire n'est pas une empreinte : le second ensemble perdu par réutilisation de prix périmés (2026-09-10)
+
+The 50-draw ensemble launched on the evening of 2026-09-09 reported 50/50 complete at 07:10 the next
+morning, in eleven hours. It should have taken forty-four. **Nine draws were computed; the other
+forty-one reused the price parquets of the ensemble that had just been discarded as wrong.**
+
+### The mechanism, and why the existing guard did not fire
+
+`run_projection_20y` skips any year whose `prices_<y>.parquet` exists. That is deliberate and worth
+keeping — it is what lets an ensemble survive a reboot. But *the file exists* is not *the file came from
+this model*, and the two had been conflated once before: in August a fresh ensemble inherited a smoke
+run's years, and the fix was to namespace the work directory on the output directory name:
+
+```python
+work = Path("scratchpad/mc") / out_root.name / f"proj_{draw:03d}"
+```
+
+with a comment stating that this "stops it leaking BETWEEN ensembles". It does not. It stops it leaking
+between ensembles *with different names*. On 2026-09-09 the four-defect availability repair landed,
+`reports/mc50` and the fifty `availability_mc` partitions were deleted, and the ensemble was relaunched
+into `reports/mc50` — the same name. `scratchpad/mc/mc50` had not been deleted, because it is a scratch
+directory and nothing pointed at it. The name matched, and forty-one draws found twenty years each of
+pre-repair prices waiting for them.
+
+**A guard that asks the operator to remember something is not a guard.** That is the whole finding. The
+August fix was correct in mechanism and wrong in kind: it moved the failure from "will anyone notice" to
+"will anyone remember", which is the same bet at longer odds.
+
+### Four layers of reassurance, again
+
+Every surface said the ensemble was fine. `.draw_complete` was written for all fifty — correctly, since
+the deliverables *were* built; they were built from old parquet. `CountMarkers` in `run_all.ps1` counted
+fifty. The progress bar reached 50/50. Each stale draw even re-projected step v onto its own fresh
+weather and wrote a correct `availability_mc/wdraw=d` partition — which was then never read, because the
+dispatch had no year left to solve. Eleven hours instead of forty-four was the only visible tell, and it
+reads as good news.
+
+The one line that would have given it away was in the log all along:
+
+```
+[20y] horizon 2027-2046 (20 years),  0 to run, draw=0
+```
+
+forty-one times. Corroborated by `[fr_availability]` printing exactly 180 applied lines — nine draws ×
+twenty years — and by only labels `wdraw=2..10` ever appearing.
+
+### What it was worth, measured
+
+Splitting the ensemble by provenance, FR mean spot, the nine computed draws against the forty-one reused:
+
+| period | computed | reused | diff |
+|---|---|---|---|
+| 2027-30 | 62.4 | 64.0 | −1.6 |
+| 2031-35 | 58.6 | 60.5 | −1.9 |
+| 2036-42 | 65.5 | 63.6 | +1.9 |
+| 2043-46 | **78.1** | **66.0** | **+12.1** |
+| horizon | 65.67 | 63.38 | +2.29 |
+
+That is the availability repair's own signature — it reproduces the single validation run on
+REFERENCE_WEATHER_20Y (+2.1 horizon, +13.1 over 2043-46) almost exactly. The ensemble was a mixture of
+two models whose late-horizon prices differ by twelve euros, presented as one distribution.
+
+### The repair: hash the model, not the name
+
+`scripts/model_fingerprint.py` digests everything that decides a price — every `*.py` in the five model
+packages and `powersim_core`, the four scripts that carry a draw end to end, every `config.yaml`, and the
+resolved scenario workbook byte for byte — plus the scalars passed in (master seed, `n_weeks`). 190
+components. The work directory becomes `scratchpad/mc/<ensemble>-<digest>/`, so a year produced by a
+different model is not rejected, it is simply **not found**.
+
+Two details earn their keep:
+
+  * **The `.draw_complete` marker carries the digest too.** Without that the guard has a hole one level
+    above itself: a marker from another model skips the draw entirely, before the fingerprinted work
+    directory is ever consulted. A marker naming a different model now prints `RECOMPUTING`.
+  * **`FINGERPRINT.json` records the full component map**, not just the digest. A bare hash says
+    something moved; `python scripts/model_fingerprint.py a/FINGERPRINT.json b/FINGERPRINT.json` names
+    the file. That is the difference between diagnosing a cache miss in five seconds and in an afternoon.
+
+A missing package tree is recorded as `ABSENT` rather than skipped, so a truncated checkout cannot hash
+identical to a complete one. The weather cube is deliberately not hashed: for the Monte-Carlo it does not
+exist yet and the seed already determines it; a caller running on a fixed cube passes it through `extra`.
+
+`tests/test_model_fingerprint.py` covers it, including a mutation check — reverting the marker comparison
+to the pre-fix behaviour fails `test_draw_marker_is_not_trusted_across_models` and nothing else.
+
+### The nine computed draws were kept, and the keeping was verified rather than asserted
+
+Draws 2-10 were computed by the current model and are sound, so they were moved into the fingerprinted
+work directory instead of being recomputed — about ten hours saved on a forty-four hour job. But the only
+thing that had changed since they ran was `run_montecarlo.py` itself, edited by hand in the same session
+to add this guard, and "I know what I changed" is precisely the class of claim this file exists to
+distrust.
+
+So it was measured: draw 2's weather cube was regenerated from `SeedSequence([20260629, 2])`, year 2044
+recomputed from scratch under the current code, and the result compared against the cached parquet.
+**8736 hours x 24 columns, maximum absolute difference 1.8e-12 EUR/MWh** -- HiGHS round-off, not a
+behavioural difference -- with FR mean 77.6776734062 on both sides. The nine draws stand, and
+`GRANDFATHERED.json` in the work directory records which draws, why, and the measurement.
+
+### What this costs and what it buys
+
+Forty-one draws to recompute at ~3.3 h each, three at a time: about forty-four hours. The sensitivity set
+is deferred until the ensemble is rebuilt, because six workers on this machine thrashes and the two stages
+must not share it.
+
+The guard is currently wired into `run_montecarlo` only. `run_sensitivities` writes straight into
+`reports/sens/<id>` and was verified clean for this run -- the directory was empty when it started -- but
+it has the same shape of exposure and should take the same fingerprint before the next sensitivity set.
+
+## Les exports horaires entrelaçaient les vingt années, et corriger un formatage aurait re-résolu tout l'ensemble (2026-09-14)
+
+### The defect
+
+Every per-year `prices_<y>.parquet` written by `run_projection_20y` is indexed on the REFERENCE calendar
+(2019-01-01 .. 2019-12-30 23:00, 8736 h), because `projection._align` lays hour k of the target year's weather
+onto hour k of the reference year so the weekly-window machinery can slice it. `build_projection_deliverables`
+concatenated the twenty years and called `sort_index()`. The years were therefore interleaved hour by hour —
+and pandas' default sort is not stable, so even their order within one timestamp was arbitrary.
+
+`hourly_spot_prices.csv` and the "Hourly spot" sheet of `projection_20y_spot_prices.xlsx` held 174,624 rows over
+**8,736 distinct timestamps, every one stamped 2019**, adjacent rows from different years: draw 0's first rows read
+FR 110.24 -> 1.99 -> 105.51 -> 158.79 -> 76.35 within `2019-01-01 00:00`. No per-year hourly series could be
+recovered from either file. Found by another session building an IRR study, which had already switched to the
+per-year parquets.
+
+### What it did not touch, verified rather than argued
+
+Every yearly table — price summary, revenue and capture by technology, congestion rent, negative hours, adequacy —
+is computed per year inside the loop, before the join. Recomputed from the per-year parquets for all 21 completed
+draws x 20 years x 12 zones, `price_summary.csv` agrees to **5.7e-14** on mean, median, max and min. The boxplots,
+the sensitivity overlays and the IRR study read those tables or the parquets, never the hourly export.
+`archive_mc50.py` already excluded both files from the summary archive as bulky.
+
+Affected: the two hourly exports in every `reports/mc50/draw_XXX` and in `reports/projection_20y`.
+
+### The repair
+
+`to_target_calendar` inverts `_align`: the same offset from 1 January, onto the year's own calendar. That keeps a
+leap day where the target year has one and leaves the hours of a window dropped on the solve budget out, rather
+than sliding the rest of the year onto them. The years are joined in order with no sort, and the joined index is
+asserted strictly increasing. The Notice sheet now says what the timestamps mean.
+
+`tests/test_build_projection_deliverables.py` builds two synthetic years on the 2019 calendar — one leap, one with a
+dropped 24 h window — and checks the export is increasing, stamped per year, not interleaved, gap-preserving, value-
+faithful, and that the yearly tables are unchanged. Against the unfixed builder 5 of 6 fail; against a mutant that
+restores only the old join, the 4 calendar tests fail and the aggregate test passes, as it should.
+
+### The defect behind the defect: the fingerprint hashed something that cannot change a price
+
+`model_fingerprint` listed `build_projection_deliverables.py` among the scripts that "carry one draw end to end".
+It does not carry a solve. It runs after the dispatch, in its own process, reads the per-year parquets and formats
+them; nothing on the solve path imports it (checked: its only callers are `run_montecarlo` and
+`run_sensitivities`, both by subprocess after the solve). But because it was hashed, this one-line formatting fix
+would have renamed the ensemble's work directory at the next restart — and with Windows Update rebooting the
+machine twice in three days, a restart is not hypothetical — and re-solved all 50 draws, **~6 days**, to reproduce
+parquets that were already correct.
+
+A guard that makes every harmless fix expensive teaches people to route around it. So:
+
+  * the builder moves to `model_fingerprint.NON_SOLVE`: the solve digest keys the work directory on what can change
+    a solved year and nothing else;
+  * deliverables carry their own `.deliverables_fingerprint` (the builder's digest), written LAST;
+  * `scripts/migrate_ensemble.py` bridges the one-time change of digest. `migrate` renames an earlier work
+    directory ONLY when its recorded `FINGERPRINT.json` is identical to the current files on every solve component
+    — a machine-checked equivalence, here `2424d74deccf` on both sides — restamps the draw markers, and rebuilds
+    stale deliverables. It refuses (exit 2) when earlier work exists that the current solve model did not produce,
+    and (exit 3) while any solver is alive. `rebuild` re-formats completed draws while the ensemble runs: into a
+    temp dir, weather tab re-attached from `weather_summary.csv`, hourly export verified against the solved
+    parquets, files moved in, stamp last;
+  * `run_all.ps1` runs `migrate` at startup, under the lock and after the orphan sweep, and does NOT start
+    `run_montecarlo` if it fails: a scheduled task must never decide on its own to re-solve an ensemble.
+
+The migration has not run yet and does not need to: the ensemble in flight keeps its in-memory digest
+`723f1f75b645` and its work directory until it stops. At the next driver start the rename happens with no solver
+alive. `tests/test_migrate_ensemble.py` covers the rename, the refusal on a solve change, the refusal under live
+solvers, the dry run, the no-op, and the recovery of a migration interrupted between rename and restamp.
+
+### Two gaps the new Notice row now names
+
+Every 2046 carries 8,640 hours, not 8,736: the weather cube's 175,200 hours do not cover the horizon's five leap
+days, so it ends on 26 December 2046, identically in every draw. And draw 18 / 2037 carries 8,568: reference week
+42 (22-28 October) exceeded the 300 s window budget and was dropped. `run_projection_20y` prints `DROPPED` and still
+writes the year's completion marker, and nothing downstream checks an hour count; the log that recorded it was
+overwritten by later restarts and it was found only by scanning row counts across all 1,368 year files.
+
+## Le vent à 100 m culminait l'après-midi au lieu du soir, et l'empreinte du modèle ne l'aurait pas vu (2026-09-14)
+
+### The defect, in price terms
+
+The weather generator co-generates the 100 m wind that step iv turns into French onshore and offshore output.
+Its national diurnal cycle peaked at 13-14 UTC; ERA5 peaks at 20 UTC and observed RTE onshore production at
+21 UTC. So every projected year put wind output into the solar hours — deepening the midday surplus the model
+already prices near zero — and took it out of the evening ramp, where prices form. Cause, measurements and the
+repair are in `weathergen/DECISIONS.md` ("wind100 diurnal shear"): the transfer had no hour term, and the
+stability-driven shear cycle sat in a residual simulated as stationary noise. Refit, the co-generated national
+cycle matches ERA5 to within 0.4 h in every season on a held-out generator realization (profile corr 0.97-0.99).
+
+### The fingerprint would not have noticed
+
+`model_fingerprint` hashed the five model packages, the solve scripts, the configs and the workbook. It did NOT
+hash:
+
+  * the `weathergen` package — `mc_weather.generate_cube` imports it for every draw;
+  * any FITTED ARTEFACT: `weathergen/models/wind100.json` and `fitted.json(.npz)`, `res_model/models/*`,
+    `demand_model/models/*`, `availability_model/models/*`, `reports/markup_model.json`.
+
+A refit changes nothing but those files. Had the ensemble been relaunched after this refit, the digest would have
+been unchanged, and every year already solved on the old wind field would have been reused as if it belonged to
+the new one — the failure this module was written to make impossible, through a door it had left open.
+
+They are now hashed. Zip archives above 256 MB (the 2.8 GB `fitted.json.npz`) are hashed on size, head and
+tail: an npz is a zip, whose central directory at the tail carries every member's CRC32, so any change to any
+array moves the tail. Any other file is hashed in full (as first written this sampled every large file; the review
+entry below narrowed it). Backups live in sub-directories (`models/backup_pre_diurnal/`), outside the top-level
+globs, so keeping or deleting one never moves the digest. Tests:
+`test_fitted_artefacts_and_the_weather_generator_are_part_of_the_digest`,
+`test_a_large_npz_is_sampled_and_a_change_to_a_middle_member_still_moves_the_digest` and
+`test_a_large_file_that_is_not_a_zip_is_hashed_in_full`.
+
+### What it invalidates
+
+Everything simulated on the old wind field:
+
+  * the 21 completed Monte-Carlo draws (work directory `scratchpad/mc/mc50-723f1f75b645`, deliverables
+    `reports/mc50/draw_000..020`) — the ensemble must be recomputed from scratch;
+  * `archive/REFERENCE_WEATHER_20Y.nc`, stitched from the old draw cubes and selected on the old ensemble's
+    prices — it must be re-selected once the new ensemble exists, and the sensitivities run after that;
+  * the default cube `weathergen/output/simulation.nc` (regenerated; every other variable verified bit-identical).
+
+The guard behaves as intended: with the digest changed and the old work directory present,
+`migrate_ensemble.py migrate` refuses (exit 2) and `run_all.ps1` does not start a solve until that directory and
+the old deliverables are moved aside deliberately. The deliverables rebuild for the old draws was stopped: it
+was re-formatting results that no longer stand.
+
+## La revue adverse du correctif du vent : ce qu'une relance aurait encore réutilisé de l'ancien modèle (2026-09-14)
+
+An adversarial review of the wind100 refit ran five independent dimensions, and each serious finding was checked by a skeptic told to refute it. Nothing that was checked was refuted outright. Most of what it found was not in the refit itself but in the path a relaunch would take: places where the ensemble's own guard could be walked around.
+
+### Three cubes of the old wind, one step from being reused
+
+`run_draw` reused any cube at `scratchpad/mc/cube_<d>.nc` that existed. The draws interrupted on 2026-09-11 had left `cube_021/022/023.nc` behind, all 853.6 M bytes and so all above the truncation guard in `run_all.ps1`. Their national 100 m wind peaked at 14 UTC, the pre-fix phase, so a relaunch would have priced draws 21-23 of the NEW ensemble on the OLD wind under the NEW digest.
+
+Their driver caches (`res/proj_drivers` and `demand/projection_features`, realizations 21-23) were NEWER than the cubes, so the mtime freshness test would have called them fresh too. Three verifiers measured it independently. All six artefacts were deleted.
+
+For the structure, the cube now lives in the fingerprinted work directory, `scratchpad/mc/<ensemble>-<digest>/cube_<d>.nc`. `generate_cube` writes it to a temp name and renames it, and stamps `model_fp`. It is reused only when its attributes name this model, this master seed and this draw; any other cube is regenerated.
+
+### A recomputing draw no longer looks complete
+
+When a marker named another model, `run_draw` recomputed, but the old `.draw_complete` stayed until the very end. Meanwhile `consolidate_mc50.py`, `archive_mc50.py` and `mk_sens_overlay_charts.py` counted any marker whose file existed. So during a three-day relaunch every consolidation would have merged recomputed and not-yet-recomputed draws. Worse, a draw that failed kept its old marker for good.
+
+The marker and the deliverables stamp are now retired before any work. The three scripts select only draws whose marker names one model: the model on disk by default, or `--fingerprint`. They report what they leave out. The archive now hashes only those draws' files rather than everything under `reports/mc50`, and records the fingerprint in its manifest.
+
+### The digest is checked on every draw, not once per ensemble
+
+`fp` was computed at launch, while each draw imports whatever is on disk, in fresh interpreters. An edit during a multi-day run would have put two models under one digest. The stated reason for hashing once was that it was too expensive. Measured, the full component map costs 0.7 s, against about 3.3 h per draw. Each draw now re-hashes and refuses to write under a changed model. The digest and `FINGERPRINT.json` are also derived from one component map, so they can no longer describe two different states.
+
+### What the fingerprint still did not see
+
+- **The SQLite database (17.7 GB).** It is read throughout the solve. It is identified by size and modification time, never content-hashed. Nothing on the solve path writes it (checked: only ETL and ERA5 ingestion do), so it cannot move under a run.
+- **About twenty behaviour switches in the environment**, `DISPATCH_*` and `POWERSIM_*`: flexibility VOM, demand scale, GB capacity, unclassified generation and the like. Every one that is set is now hashed. The per-draw values `run_montecarlo` sets itself are excluded, and so is `POWERSIM_SCENARIOS`, whose effect the workbook's bytes already carry.
+- **Library versions:** HiGHS, numpy, scipy, pandas, xarray, netCDF4, pyarrow and Python. A HiGHS upgrade can change which vertex a degenerate LP returns, and so the prices.
+- **`weathergen/output/zone_hist.parquet`**, the observed per-zone weather the neighbour response is fitted on.
+
+The large-file sampling claim was verified on the real file. `fitted.json.npz` is a zip64 archive with 1005 stored members and a central directory 57 KB from the end. But the scheme applied to ANY file above 256 MB. It now samples zips only, and hashes anything else in full.
+
+The old sampling test flipped a byte inside the sampled tail, so any head/tail scheme would pass it. It is replaced by two tests. The first edits a middle member of a real `np.savez` at the same size and checks the digest moves. The second checks a large non-zip is hashed in full. Environment and database components are tested too. The live-repository test now skips on a checkout without the gitignored artefacts, where it used to fail.
+
+### Driver caches remember which cube built them
+
+`projection_drivers` and `projection_features` were keyed on the realization number, with "cache newer than cube" as the freshness test. Three different cubes use realization 0: the default cube, `REFERENCE_WEATHER_20Y`, and Monte-Carlo draw 0. Whichever was written last looked fresh for the other two. `golden/baseline.json` recorded a `w100_nat` mean of 5.668613, which is the French mean of the REFERENCE cube, not of `simulation.nc`.
+
+Each partition now carries a `source_cube.json` sidecar with the cube's resolved path, size and mtime (ns). A cache is fresh only when the sidecar names the cube that will really be read. Partitions from before the sidecar have none and are rebuilt. Test: `powersim_core/tests/test_cache_identity.py`.
+
+### The sensitivities had no guard at all
+
+- **No fingerprint.** `reports/sens/s00/s01/s02` held 27 pre-fix years that a relaunch would have resumed from.
+- **Stale reference weather.** `REFERENCE_WEATHER_20Y.nc` is itself pre-fix: its 100 m wind peaks at 14 UTC.
+- **Stage 2 ran after a refused stage 1.** `run_all.ps1` started it anyway.
+
+Now:
+- **Each variant is keyed on its own digest**: the model, plus the reference cube's identity, the variant's environment and its workbook's hash.
+- **Another model's results are moved to `reports/sens/_stale/`**, never deleted and never resumed.
+- **`.sens_complete` carries the digest.**
+- **A reference cube older than `weathergen/models` is refused** unless `--allow-stale-reference` is passed.
+- **`run_all.ps1` skips stage 2 when stage 1 was refused.**
+
+### The readers counted what the runner would recompute
+
+`consolidate_sensitivities.py` and `mk_sens_overlay_charts.py` counted any `.sens_complete`. Until each stale variant's slot came round, a relaunch would have published deltas between a new-model baseline and old-model variants. They now count a variant only when its marker names the fingerprint from `run_sensitivities.variant_fingerprints`, the one definition the runner writes with. `check_reference_weather.py` likewise compares a reference run only against draws of the model on disk.
+
+`build_reference_weather.py` trusted both of its inputs:
+- **Cubes:** it reused any cube left in `scratchpad/refweather/` (none is there today). It now reuses one only when its attributes name this model, seed and draw.
+- **The year map:** it took `ref_weather_map.json` as given. It now refuses a map that names a draw not complete under the model on disk, unless `--allow-unverified-map` is passed. That condition is necessary, not sufficient: no committed tool writes the map yet.
+- **Its output:** written through a temp name and stamped `model_fp`. A killed write can no longer leave a newer, truncated reference that would pass the sensitivities' age check.
+
+The truncated-cube guard in `run_all.ps1` now recurses into the fingerprinted work directories, where the cubes moved.
+
+### And one mislabelled summary
+
+`mc_weather.weather_summary`, the "Weather (this draw)" tab of every draw, averaged all 76 European stations as if they were France. On the 2026-08 cube that gave a 100 m wind of 5.58 m/s against 5.69, and a temperature of 12.4 °C against 13.2. It now uses the French stations.
+
+### Left open, deliberately
+
+- **Nothing in the repository selects `REFERENCE_WEATHER_20Y`.** `build_reference_weather.py` reads a `ref_weather_map.json` that no committed script writes. Re-selecting it on the new ensemble needs that tool first.
+- **The golden baseline was recaptured**, after rebuilding the realization-0 projections from the default cube (backup `golden/baseline_pre_wind100_20260914.json.bak`). Five of fourteen artefacts moved, and not all of it is the wind:
+  - the drivers and features also carried another cube's temperature (the realization-0 sharing above);
+  - `res/production` had been frozen since 2026-07-15;
+  - `demand/projection_hourly` (−17.5 %) had been frozen since 2026-08-12, before the demand moderation that aba6a5d committed (see "The French demand sensitivities" above).
+
+  Quantified in `REVIEW.md` §13.
+- **`reports/irr_nancy_mc21/site_weather.py`**, the other session's IRR study, re-implements the pre-fix 100 m formula as `a + b·log w10` and ignores the refit's terms. Its guard checks only `c is None`. It is flagged, not edited. After its per-site quantile mapping the effect on capture timing is small (hourly CF correlation 0.985), but its docstring's claim of an exact replay no longer holds.
+
+Tests: `tests/test_montecarlo_relaunch.py` (5), `tests/test_sensitivity_markers.py` (2), the updated `tests/test_model_fingerprint.py`, and `powersim_core/tests/test_cache_identity.py`.

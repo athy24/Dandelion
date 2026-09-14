@@ -37,15 +37,15 @@ Outputs: availability by technology, per-nuclear-unit detail, interconnector NTC
 
 | check | status | detail |
 |---|---|---|
-| noncrisis_nuclear_Kd | PASS | 0.765 vs [0.73, 0.78] |
-| common_mode_crisis_trough | PASS | worst annual Kd 0.564 vs ~0.54 target (2022) |
-| quiet_draws_no_false_crisis | PASS | worst annual Kd on quiet draws 0.670 (should stay > ~0.66) |
+| noncrisis_nuclear_Kd | PASS | 0.748 vs [0.73, 0.78] |
+| common_mode_crisis_trough | PASS | worst annual Kd 0.591 vs ~0.54 target (2022) |
+| quiet_draws_no_false_crisis | PASS | worst annual Kd on quiet draws 0.682 (should stay > ~0.66) |
 | common_mode_return_period | PASS | 22.5 yr vs [15, 30] |
-| planned_summer_seasonality | PASS | summer 1.21 vs winter 0.68; planned unavail 0.211 |
-| availability_bounded | PASS | mean Kd across draws in [0.749, 0.767] |
-| weather_derating_coupling | PASS | 38 derated unit-days, summer-concentrated=True |
+| planned_summer_seasonality | PASS | summer 1.19 vs winter 0.71; planned unavail 0.210 |
+| availability_bounded | PASS | mean Kd across draws in [0.737, 0.750] |
+| weather_derating_coupling | PASS | 924 derated unit-days, summer-concentrated=True |
 
-Non-crisis Kd **0.765**, common-mode return 23 yr,
+Non-crisis Kd **0.748**, common-mode return 23 yr,
 5/8 validation draws carried a common-mode event.
 
 ## Known limitations

@@ -280,7 +280,10 @@ reference-year weather with a warning.
   through the engines by default with negatives forming across zones.
 - **FR nuclear + reservoir availability from step-v (#160).** `rolling/fr_availability.py` reads the
   availability_model lake — daily nuclear availability *fraction* (`availability_by_tech`, per draw, ÷ that
-  draw-year's fleet peak so it is a pure outage-pattern signal decoupled from the TYNDP capacity level) and
+  INSTALLED capacity of that day, written by step v under the same operating window that produced the
+  numerator, so it is a pure outage-pattern signal decoupled from the TYNDP capacity level -- it was the
+  draw-year's fleet PEAK until 2026-09-09, i.e. the annual maximum of the numerator itself, which ran the
+  fraction ~6.8 points high because the best day of a year is never a full-availability day) and
   the weekly reservoir energy budget (`reservoir_budget`). `project_year` feeds the nuclear fraction to
   `fr_window(nuc_unavail_daily=…)` — the same hook the backtest uses for the REMIT feed (#78) — as outage MW
   at the projected `nuc_cap`, and overrides the `hydro_reservoir` energy cap per window. Mapped target→

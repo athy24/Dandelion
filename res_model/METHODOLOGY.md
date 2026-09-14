@@ -24,9 +24,15 @@ recalibrated** to reproduce observed national capacity factors and their distrib
   **station-10 m → ERA5-100 m log-linear transfer with lag terms** is estimated on the historical
   overlap (national onshore R² 0.70, shear b 1.20). The §2.A cross-check flagged the station basis as a
   materially weaker *hourly* predictor than ERA5 (station→CF R² 0.61 vs 0.80), so — per the spec — step
-  (ii) was extended to **co-generate ERA5-100 m wind** conditioned on the station draws (a spatially-
-  correlated AR(1) residual over the transfer; the cube now carries `wind_speed_100m_ms`). Projection
-  therefore reads a physically-realistic 100 m field, coherent with the rest of the weather draw.
+  (ii) was extended to **co-generate ERA5-100 m wind** conditioned on the station draws (the cube carries
+  `wind_speed_100m_ms`). Projection therefore reads a physically-realistic 100 m field, coherent with the
+  rest of the weather draw. Since 2026-09-14 that transfer's intercept and shear exponent vary with season
+  and local solar hour, so hub-height wind peaks in the evening (ERA5 20 UTC) instead of following the
+  10 m wind's afternoon peak. Its residual is a spatially-correlated AR(1) plus a persistent national common
+  factor, which restores the national variance. Driven through this model's onshore conversion, the French
+  onshore profile now has RTE production's first-harmonic phase (20.2 h), with profile correlation 0.94;
+  before the fix it was 13.7 h, with correlation −0.10. Its hourly CF p95 is 0.568, against 0.567 for the
+  same conversion on ERA5 wind (0.539 before). Details: `weathergen/DECISIONS.md` ("wind100 diurnal shear").
 - **PV irradiance (D3).** Derived from cloud with the **same** clear-sky (pvlib Haurwitz) × Kasten–
   Czeplak chain the demand model uses, so the demand↔PV irradiance signal is one and the same.
 - **Offshore.** Coastal-station → farm-site 100 m via ERA5-estimated ratios; farm power curves; short

@@ -40,11 +40,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 _ROOT = Path(__file__).resolve().parents[2]                    # …/PriceModeling (repo root)
 
-import pandas as pd                                                            # noqa: E402
+import pandas as pd  # noqa: E402
+from dispatch_model.config import load_config  # noqa: E402
+from dispatch_model.rolling.projection import _preload, project_year  # noqa: E402
 
-from powersim_core.progress import Progress                                    # noqa: E402
-from dispatch_model.config import load_config                                  # noqa: E402
-from dispatch_model.rolling.projection import _preload, project_year           # noqa: E402
+from powersim_core.progress import Progress  # noqa: E402
 
 
 def _ensure_step_v_availability(draw: int, refresh: bool = False) -> None:
@@ -58,7 +58,12 @@ def _ensure_step_v_availability(draw: int, refresh: bool = False) -> None:
     from powersim_core import lake
     if not refresh:
         try:
-            lake.read_table("availability_mc", "availability_by_tech", wdraw=draw)
+            _t = lake.read_table("availability_mc", "availability_by_tech", wdraw=draw)
+            # REUSE ONLY WHAT IS USABLE. Reading is not enough: the 50 archived partitions read fine and
+            # carry no `installed_mw`, so a bare existence probe printed "reusing ..." and then died four
+            # minutes later inside the preload. Fall through to re-projection instead.
+            if "installed_mw" not in _t.columns or not _t["installed_mw"].notna().all():
+                raise ValueError("partition predates installed_mw")
             print(f"[20y] step-v availability: reusing availability_mc/wdraw={draw} "
                   f"(--refresh-avail to re-project on the current cube)", flush=True)
             return

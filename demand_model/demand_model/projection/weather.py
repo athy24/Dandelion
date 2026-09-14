@@ -36,9 +36,11 @@ def projection_features(config: Config, realization: int = 0, force: bool = Fals
     cache = lake.table_path("demand", "projection_features", realization=realization)
     from powersim_core.weather_cube import effective_cube_path
     cube_path = effective_cube_path(config.resolve(config.section("projection")["weathergen_output"]))
-    fresh = (cache.exists() and cube_path and cube_path.exists()
-             and cache.stat().st_mtime >= cube_path.stat().st_mtime)
-    if fresh and not force:                          # invalidate if the cube was regenerated
+    from powersim_core.weather_cube import cache_is_fresh, record_cache_source
+    # fresh only if the cache's sidecar names the cube that will really be read (see cache_is_fresh): the
+    # realization number alone is shared by several cubes
+    fresh = bool(cube_path) and cache_is_fresh(cache, cube_path)
+    if fresh and not force:
         return lake.read_table("demand", "projection_features", realization=realization)
 
     weather, stations = _tidy_weather(config, realization)
@@ -58,4 +60,5 @@ def projection_features(config: Config, realization: int = 0, force: bool = Fals
             feat[c] = feat[c].bfill()
 
     lake.write_table(feat, "demand", "projection_features", realization=realization)
+    record_cache_source(cache, cube_path)
     return feat

@@ -19,8 +19,16 @@ from ..projection.planned_scheduler import planned_metrics, schedule_planned
 
 
 def _nuclear_daily_kd(config, model, registry, draw, temp, hstart, days, nd, nuc_mask, nuc_cap):
+    """Kd against the INSTALLED fleet OF THAT DAY, not a horizon-constant denominator.
+
+    `nuc_cap` used to be the sum over units with no closure year at all, so once the retirement schedule
+    was synced from the dispatch it lost 22 reactors and reported Kd 0.900 for a fleet running at 0.75.
+    `_operating_mask` is the same authority the projection uses for both numerator and denominator."""
+    from ..projection.engine import _operating_mask
     avail, _, _ = _assemble_draw(config, model, registry, draw, temp, hstart, days, nd)
-    return pd.Series(avail[nuc_mask].sum(axis=0) / nuc_cap, index=days)
+    inst = (registry["capacity_mw"].to_numpy(float)[:, None] * _operating_mask(registry, days))
+    denom = inst[nuc_mask].sum(axis=0)
+    return pd.Series(avail[nuc_mask].sum(axis=0) / np.where(denom > 0, denom, 1.0), index=days)
 
 
 def run(config: Config, n_draws: int = 15) -> dict:
@@ -29,7 +37,11 @@ def run(config: Config, n_draws: int = 15) -> dict:
     registry = load_scenario_registry(config)
     temp, _ = load_national_weather(config)
     hstart, days, nd = _horizon(config)
-    nuc_mask = ((registry["technology"] == "nuclear") & registry["closure_year"].isna()).to_numpy()
+    # every nuclear unit, with the operating window applied per DAY inside `_nuclear_daily_kd` — not
+    # "units that never close", which silently drops the whole retiring fleet from both sides
+    _cl = pd.to_numeric(registry["closure_year"], errors="coerce")
+    nuc_mask = ((registry["technology"] == "nuclear")
+                & (_cl.isna() | (_cl > hstart.year))).to_numpy()
     nuc_cap = registry.loc[nuc_mask, "capacity_mw"].sum()
     vband = config.section("validation")
 

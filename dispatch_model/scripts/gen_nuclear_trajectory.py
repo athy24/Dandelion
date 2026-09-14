@@ -17,9 +17,9 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from dispatch_model.config import load_config                    # noqa: E402
-from dispatch_model.stacks import nuclear_fleet as nf            # noqa: E402
-from dispatch_model.stacks.fr_stack import build_fr_stack        # noqa: E402
+from dispatch_model.config import load_config  # noqa: E402
+from dispatch_model.stacks import nuclear_fleet as nf  # noqa: E402
+from dispatch_model.stacks.fr_stack import build_fr_stack  # noqa: E402
 
 # 2019 is the projection's REFERENCE year: `tyndp_factors` computes target/reference, so without a
 # reference-year row the ratio is undefined and the tech escapes scaling entirely.
@@ -30,7 +30,12 @@ YEARS = (2019, 2023, 2025, 2028, 2030, 2032, 2035, 2040, 2045, 2050)
 ZONES = ("FR", "BE", "CH", "ES", "DE_LU", "NL")
 
 cfg = load_config("config.yaml")
-wb_path = cfg.resolve(cfg.section("assumptions")["workbook"])
+# through `scenario.resolve`, so `POWERSIM_SCENARIOS` redirects this generator at the same workbook the
+# models read. It reads and writes the file directly (openpyxl, to preserve the user's other tabs), which
+# would otherwise make it the one place in the repo that ignores the switch.
+from powersim_core.scenario import resolve as _resolve_wb  # noqa: E402
+
+wb_path = _resolve_wb(cfg.resolve(cfg.section("assumptions")["workbook"]))
 
 # CLI knobs. Neighbours (BE/CH/NL) use nf.LIFETIME_YEARS (`--lifetime N` to override). FRANCE is GLIDED to a
 # 2050 target by partial oldest-first phase-out: `--fr-target-2050 G` (default 52, RTE-N03), `--fr-min-life Y`
@@ -92,7 +97,7 @@ if "--write" not in sys.argv:
     print("\n(dry run — pass --write to update the workbook)")
     raise SystemExit
 
-from openpyxl import load_workbook                               # noqa: E402
+from openpyxl import load_workbook  # noqa: E402
 
 wb = load_workbook(wb_path)
 if "dispatch_nuclear_newbuild" not in wb.sheetnames:        # create the dedicated scenario input

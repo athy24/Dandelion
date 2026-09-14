@@ -147,3 +147,38 @@ historical −0.34, because future load (EV/HP/electrolysis) is genuinely less t
 cube's slightly-lower coupling is *partly the right direction*. Effort ≫ benefit. If ever revisited, the lever
 is a small winter contemporaneous term in `innov_chol_m`, re-validated against the full Phase-8 dependence suite
 — not the EOF rank.
+
+---
+
+## 2026-09-14 — after the diurnal refit and the residual's common factor
+
+The wind100 co-generation was refit (`DECISIONS.md`, "wind100 diurnal shear"): a diurnal and seasonal transfer, a
+national recalibration, and a national common AR(1) factor in the residual carrying 19 % of its variance.
+
+**The metric used here is not §79's.** It is the one printed by `scripts/fit_wind100.py`'s report: DJF hours,
+national means of the 42 stations, each series with an annual two-harmonic mean removed, 100 m wind in m/s. On
+ERA5 history it gives 0.344, where §79's definition (day-of-year climatology, log w100) gave 0.28. The rows below
+compare with each other only.
+
+| within-winter corr(temp, w100) | pre-fix model | refit, before the common factor | refit, with it | ERA5 history |
+|---|---|---|---|---|
+| held-out generator realization (seed+303, 20 years) | 0.244 | — | 0.213 | 0.344 |
+| default cube `output/simulation.nc` | 0.227 | 0.229 | 0.193 | 0.343 |
+
+**What moved it.**
+- **The diurnal terms:** they left the coupling where it was.
+- **The common factor:** it lowered the coupling by about 0.03. It is independent of temperature by
+  construction. It is also what brought the national 100 m variance back to ERA5's:
+  - national anomaly std: x0.87 → x1.02;
+  - onshore CF p95: 0.539 → 0.568, against 0.567 on ERA5;
+  - winter p95: 0.607 → 0.670, against 0.680.
+
+  More temperature-free variance at the national scale dilutes the coupling the transfer carries over from 10 m.
+
+**Kept, deliberately.**
+- **Why:** the national variance and the winter upper tail reach prices directly, through the onshore CF. The
+  coupling reaches them only through the joint demand–RES distribution.
+- **What a fix could recover is small:** §79 found the historical national residual carries only 0.10 temperature
+  coupling (measured under the pre-fix transfer).
+- **The lever, if this is ever reopened:** a common factor correlated with the national temperature anomaly. It
+  has not been tried.

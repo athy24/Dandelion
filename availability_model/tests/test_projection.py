@@ -37,12 +37,15 @@ def test_available_within_capacity(proj):
 
 
 def test_nuclear_kd_in_band(proj):
-    cfg, by_tech = proj
-    reg = __import__("availability_model.projection.engine", fromlist=["load_scenario_registry"]) \
-        .load_scenario_registry(cfg)
-    nuc_cap = reg.loc[(reg["technology"] == "nuclear") & reg["closure_year"].isna(), "capacity_mw"].sum()
-    kd = by_tech[by_tech["technology"] == "nuclear"].groupby("draw")["available_mw"].mean() / nuc_cap
-    assert (kd.between(0.72, 0.80)).all()                          # anchored to historical ~0.74
+    """Kd against the fleet INSTALLED THAT DAY. The denominator used to be `capacity_mw` summed over units
+    with no closure year, which drops the entire retiring fleet from the ratio the moment a retirement
+    schedule exists -- measured, that reported 0.900 for a fleet running at 0.747."""
+    _, by_tech = proj
+    nuc = by_tech[by_tech["technology"] == "nuclear"]
+    assert "installed_mw" in nuc.columns, "step v must write the installed baseline beside available_mw"
+    kd = nuc.groupby("draw").apply(
+        lambda g: g["available_mw"].sum() / g["installed_mw"].sum(), include_groups=False)
+    assert (kd.between(0.72, 0.80)).all(), f"Kd out of band: {kd.round(4).to_dict()}"
 
 
 def test_nuclear_units_states_and_availability(proj):

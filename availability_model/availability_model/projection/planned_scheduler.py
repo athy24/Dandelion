@@ -61,9 +61,24 @@ def schedule_planned(config: Config, model: CalibratedAvailability, registry: pd
     hstart = pd.Timestamp(year=proj["horizon"]["start_year"], month=1, day=1, tz="UTC")
     hend = pd.Timestamp(year=proj["horizon"]["end_year"], month=12, day=31, tz="UTC")
     vd_period = pd.Timedelta(days=365.25 * proj.get("vd_period_years", 10))
+    # BURN-IN. Refuelling was scheduled from the horizon start, with each unit's first outage drawn
+    # uniformly in [hstart, hstart + cycle) — so on 1 January of year one NO reactor was mid-outage and
+    # the fleet entered the horizon at full availability. Measured across every partition, year one ran
+    # 0.8 % to 9.7 % more available than that draw's own remaining nineteen years: about 3.8 GW of French
+    # nuclear that exists only because the simulation had just started. The fleet does not begin life on
+    # the first day of the projection, so neither does its maintenance: schedule from `burn_in_years`
+    # BEFORE the horizon and keep only what reaches into it, which leaves units mid-refuelling on day one
+    # in the proportion the cycle implies. Three years covers the longest cycle plus a décennale.
+    burn = pd.Timedelta(days=365.25 * float(proj.get("burn_in_years", 3)))
+    sstart = hstart - burn
     rng = rng or substream(config.seed, draw, "planned")   # F4: single RNG authority (SeedSequence)
 
-    nuc = registry[(registry["technology"] == "nuclear") & registry["closure_year"].isna()]
+    # CLOSED BEFORE THE HORIZON, not "carries a closure year". The old test excluded any unit with one,
+    # which was invisible while Fessenheim (2020) was the only closure — and the moment the retirement
+    # schedule was synced from the dispatch, twenty-two reactors silently stopped refuelling and the
+    # fleet-average availability jumped from 0.744 to 0.80. Same defect shape in forced.py.
+    _cl = pd.to_numeric(registry["closure_year"], errors="coerce")
+    nuc = registry[(registry["technology"] == "nuclear") & (_cl.isna() | (_cl > hstart.year))]
     rows = []
     for _, u in nuc.iterrows():
         p = model.planned.get(str(u["palier"]))
@@ -75,9 +90,12 @@ def schedule_planned(config: Config, model: CalibratedAvailability, registry: pd
         n_vp = p["types"]["VP"]["n"] or 1
         p_asr = n_asr / (n_asr + n_vp)
         # stagger: first outage within the first cycle; VD phase spread across the décennale window
-        start = _seasonal_snap(hstart + pd.Timedelta(days=rng.uniform(0, cycle.days)), rng, p["seasonality"])
-        last_vd = hstart - pd.Timedelta(days=rng.uniform(0, vd_period.days))
-        while start < hend:
+        start = _seasonal_snap(sstart + pd.Timedelta(days=rng.uniform(0, cycle.days)), rng, p["seasonality"])
+        last_vd = sstart - pd.Timedelta(days=rng.uniform(0, vd_period.days))
+        _uend = hend
+        if pd.notna(_cl.get(u.name)):
+            _uend = min(hend, pd.Timestamp(year=int(_cl.get(u.name)), month=1, day=1, tz="UTC"))
+        while start < _uend:
             if start - last_vd >= vd_period:
                 otype = "VD"; last_vd = start
             else:
@@ -90,7 +108,11 @@ def schedule_planned(config: Config, model: CalibratedAvailability, registry: pd
                          "draw": int(draw)})
             start = _seasonal_snap(start + cycle, rng, p["seasonality"])
     sched = pd.DataFrame(rows).sort_values("start").reset_index(drop=True)
-    return _deconflict(sched, hstart, hend, int(proj.get("nuclear_max_concurrent_planned", 22)))
+    # deconflict over the WHOLE simulated window, burn-in included: an outage that straddles 1 January of
+    # year one occupies the concurrency budget on both sides of it.
+    sched = _deconflict(sched, sstart, hend, int(proj.get("nuclear_max_concurrent_planned", 22)))
+    # then drop what never reaches the horizon — it has served its purpose by displacing the phase.
+    return sched[sched["end"] >= hstart].sort_values("start").reset_index(drop=True)
 
 
 def _deconflict(sched: pd.DataFrame, hstart, hend, cap: int) -> pd.DataFrame:
@@ -123,7 +145,12 @@ def planned_metrics(config: Config, sched: pd.DataFrame, registry: pd.DataFrame)
     hstart = pd.Timestamp(year=proj["horizon"]["start_year"], month=1, day=1, tz="UTC")
     hend = pd.Timestamp(year=proj["horizon"]["end_year"], month=12, day=31, tz="UTC")
     n_days = (hend - hstart).days + 1
-    nuc = registry[(registry["technology"] == "nuclear") & registry["closure_year"].isna()]
+    # CLOSED BEFORE THE HORIZON, not "carries a closure year". The old test excluded any unit with one,
+    # which was invisible while Fessenheim (2020) was the only closure — and the moment the retirement
+    # schedule was synced from the dispatch, twenty-two reactors silently stopped refuelling and the
+    # fleet-average availability jumped from 0.744 to 0.80. Same defect shape in forced.py.
+    _cl = pd.to_numeric(registry["closure_year"], errors="coerce")
+    nuc = registry[(registry["technology"] == "nuclear") & (_cl.isna() | (_cl > hstart.year))]
     load = np.zeros(n_days, dtype=np.int16)
     month_days = np.zeros(13)
     for r in sched.itertuples(index=False):

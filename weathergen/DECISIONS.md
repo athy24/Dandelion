@@ -158,3 +158,135 @@ memory / higher precip-latent persistence). Documented, not hidden.
 - Single seeded `numpy.random.Generator` threaded through fit + simulate.
 - Fit is serialized to `models/`; simulation loads and is cheap.
 - Every clip / imputation / assumption is logged in the validation report, never hidden.
+
+## wind100 diurnal shear (2026-09-14)
+
+**Defect.** The co-generated 100 m wind peaked in the early afternoon, with its 10 m driver, instead of in the
+evening. Measured on the 42 French stations, 2015-2026:
+
+| | SYNOP 10 m | ERA5 100 m | co-generated 100 m (pre-fix cube) |
+|---|---|---|---|
+| diurnal peak (UTC) | 15 | 20 | 13-14 |
+| diurnal trough (UTC) | 3 | 10 | 3-4 |
+| 100 m / 10 m ratio, night / noon | — | 1.75 / 1.18 | 1.575 / 1.41 |
+
+Observed RTE onshore production peaks at 21 UTC (trough 08), offshore at 20 UTC: the pre-fix field moved wind
+output into the solar hours and out of the evening ramp. Out of sample its national diurnal profile was
+ANTI-correlated with ERA5 (-0.25), 7 h early.
+
+**Cause.** `log w100 = a + b·log w10 + r` has no hour term. The stability-driven shear cycle (the surface layer
+decouples at night, so 100 m wind is no longer braked; daytime mixing does the opposite) therefore sat in the
+fitted residual — +0.135 log at 00 UTC, -0.200 at 10 UTC, a 0.336 swing against σ 0.487, 0.24 (DJF) to 0.44
+(JJA) — and was discarded, because the residual is simulated as stationary AR(1) noise.
+
+ERA5's 10 UTC value is itself an artefact: a one-hour notch of 0.25-0.3 m/s present in every year 2015-2026 with
+all 42 stations valid, absent from observed production — the seam between ERA5's 12-hourly analysis windows.
+It is interpolated out before fitting (W6), and everything fitted is smooth by construction, so it is not
+reproduced.
+
+| # | Decision | Choice | Evidence |
+|---|---|---|---|
+| W1 | Transfer design | intercept: seasonal K2 x diurnal K3 (LST, interacted); shear exponent: log w10 x diurnal K2 x (1 + seasonal K1). 48 coefficients per station (`DEFAULT_SPEC`) | chosen out of sample (fit 2015-22, test 2023-26) among 7 variants. Test R² 0.363 -> 0.480; overall phase error -7.1 h -> -0.4 h, profile corr -0.25 -> 0.95; DJF -0.7 h, corr 0.87 (a season-invariant shear term left DJF at -2.9 h, corr 0.66); JJA -0.1 h, corr 0.97 |
+| W2 | Diurnal residual variance | rejected | residual std varies 24 % by hour, but modelling it moved the overall phase +1.0 h and profile corr 0.95 -> 0.93 |
+| W3 | Recalibration | national seasonal K2 x diurnal K3 correction of the log mean (35 terms), estimated against ERA5 on the GENERATOR's own 10 m wind, pooled over three generator realizations (`output/simulation.nc`, seed+101, seed+202) | the generator's 10 m diurnal amplitude is 0.72x SYNOP's by first harmonic (0.77x by max - min; phase -0.25 h, corr 0.99), so a SYNOP-fitted transfer lands +1.5 h late. Validated on a fourth, held-out realization: see the table below |
+| W4 | Scope of the recalibration | a property of the pair (this transfer, that 10 m generator), enforced as one | `scripts/fit_wind100.py` estimates both in one run and records the generator fit in `recal_generator` (a digest of `models/fitted.json` and its npz sidecar); `simulate` refuses to apply the recalibration to any other generator fit (checked whenever the model co-generates at least one station; a cube with no fitted station, such as the synthetic smoke test, is returned untouched and not checked). Re-run it whenever `models/fitted.json` is refit |
+| W5 | Amplitude metric | first harmonic, not max - min | max - min is inflated on the ERA5 side by the 10 UTC notch (in DJF ~0.35 of a 0.65 m/s swing), which read as a false x0.80 amplitude deficit |
+| W6 | ERA5 analysis seams | ERA5 100 m linearly interpolated across 10 and 22 UTC before fitting (`SEAM_HOURS`) | the 10 UTC notch above and a smaller one at 22 UTC sit at the joins of ERA5's 12-hourly assimilation windows and are absent from observed production; a 48-term diurnal design otherwise bends toward them. Fit before / after: R² 0.478 / 0.481, φ 0.834 / 0.851, σ 0.439 / 0.435 |
+| W7 | Residual coherence | station AR(1) with the fitted spatial correlation, plus a NATIONAL common AR(1) factor carrying λ = 0.190 of the residual variance, persistence φ_c = 0.9786 (e-folding 46 h), σ scaled by k = 0.883 | added after review. The SYNOP-fitted residual is too weakly correlated across stations (0.11, against 0.28 for ERA5's station log anomalies), so co-generated France as a whole varied too little: national std -8 %, p95 -4.5 %, winter std -12 %, onshore CF p95 0.523 against 0.567. k and λ are calibrated, generator-driven on the three realizations of W3, to ERA5's mean station log-anomaly variance (0.344) and national anomaly std (ratio 0.872 at λ = 0, 1.000 after); φ_c is the decay of the fitted national-mean residual. Raising the station correlation instead restored the variance but pushed the national step std from 2.6x to 3.5x ERA5's |
+
+Fitted transfer: R² 0.481 (pre-fix model 0.351), b 0.599 (0.520), φ 0.851 (0.865), σ 0.435 (0.487) before the
+scale k.
+
+**Held-out generator realization** (seed+303, 20 years, used for neither W3 nor W7), national mean of the 42
+stations against ERA5 2015-2026, first harmonic:
+
+| | pre-fix model | refit model |
+|---|---|---|
+| diurnal peak (ERA5: 20 UTC) | 14 UTC | 21 UTC |
+| phase error: all / DJF / MAM / JJA / SON | -7.1 / -8.0 / -7.4 / -5.8 / -8.3 h | -0.3 / -0.1 / -0.2 / -0.2 / -0.4 h |
+| amplitude: all / DJF / MAM / JJA / SON | x1.46 / 1.30 / 1.71 / 1.23 / 1.66 | x0.99 / 0.96 / 0.96 / 1.04 / 0.97 |
+| profile correlation: all / DJF / MAM / JJA / SON | -0.24 / -0.56 / -0.28 / 0.10 / -0.54 | 0.99 / 0.97 / 0.99 / 0.99 / 0.99 |
+| monthly level | x0.922 .. x1.185 | x0.965 .. x1.056 |
+| mean / std / p05 / p50 / p95 / p99 | x1.024 / 0.974 / 1.046 / 1.037 / 0.993 / 0.992 | x1.004 / 1.018 / 0.980 / 1.011 / 0.999 / 1.010 |
+| winter (DJF) std / p95 | x0.910 / 0.918 | x0.984 / 0.988 |
+| national anomaly std: all (DJF) | x1.038 (0.907) | x1.024 (0.983) |
+| mean station log-anomaly variance | x1.103 | x0.999 |
+| cross-station coherence (ERA5: 0.279) | 0.237 | 0.284 |
+| national hour-to-hour step std | x3.75 | x2.46 |
+| autocorrelation deficit, lag 1 / 6 / 24 h | -0.08 / -0.32 / -0.34 | -0.03 / -0.10 / -0.07 |
+| within-winter temperature coupling (ERA5: 0.344) | 0.244 | 0.213 |
+
+**What did not improve, or got worse:**
+
+- **Winter temperature coupling fell**, 0.244 -> 0.213. The W7 common factor is independent of temperature, and
+  the variance it restores at the national scale dilutes the coupling the transfer carries over from 10 m. It is
+  the price of the national variance, which reaches prices directly through the onshore CF's upper tail. See
+  WIND_TEMP_COUPLING.md (2026-09-14).
+- **Still too rough hour to hour**: the national step std is 2.5x ERA5's, down from 3.75x.
+- **Distance profile of coherence not checked**: the average is right, but the common factor adds the same λ to
+  every pair of stations, near or far, and the correlation-distance profile has not been checked against ERA5.
+- **Neighbour stations inherit the French common factor**: the 34 neighbour stations take the median transfer,
+  the national recalibration and the same common factor. Their 100 m wind therefore shares France's common
+  shock, and its diurnal cycle is untested. No price consumer reads it: neighbour zones are driven by the
+  cube's 10 m wind (`dispatch_model/weather_shapes.py`).
+
+Models saved before this load with `spec=None, recal=None, common_share=None` and behave exactly as before,
+consuming the random stream identically. Pre-fix artefacts: `models/backup_pre_diurnal/wind100.json(.npz)` and
+`output/simulation_pre_diurnal_wind100.nc`.
+
+Tests in `tests/test_wind100.py`:
+- `test_the_100m_diurnal_phase_is_its_own_not_the_10m_one` asserts that the legacy form FAILS (> 2 h);
+- unknown stations follow their own local solar time;
+- the recalibration of a damped generator, and its generator guard;
+- the common factor's variance, coherence and draw order;
+- a save/load round trip.
+
+**Regenerated default cube, all 20 years** (`output/simulation.nc`, same seed and generator; the seven other
+variables verified BIT-IDENTICAL to the pre-fix cube, only `wind_speed_100m_ms` differs). National mean over the
+42 French ERA5 stations, against ERA5 2015-2026:
+
+| | pre-fix cube | regenerated cube | ERA5 / SYNOP |
+|---|---|---|---|
+| diurnal peak (argmax) | 14 UTC | 20 UTC | 20 UTC |
+| phase error, first harmonic: all / DJF / MAM / JJA / SON | -7.2 / -8.7 / -7.1 / -6.1 / -8.5 h | -0.1 / +0.5 / -0.6 / -0.3 / +0.4 h | — |
+| profile correlation: all / DJF / MAM / JJA / SON | -0.28 / -0.65 / -0.22 / 0.01 / -0.55 | 0.98 / 0.93 / 0.97 / 0.99 / 0.97 | — |
+| first-harmonic amplitude: all / DJF / MAM / JJA / SON | x1.44 / 1.13 / 1.83 / 1.26 / 1.45 | x0.92 / 0.86 / 1.01 / 0.91 / 0.96 | — |
+| 100 m / 10 m ratio, night / noon | 1.59 / 1.42 | 1.66 / 1.25 | 1.75 / 1.20 |
+| annual phase error across the 20 simulated years | -7.7 .. -6.4 h (median -7.2) | -1.5 .. +1.0 h (median -0.2) | — |
+| mean / p05 / p50 / p95 | x1.029 / 1.055 / 1.038 / 1.003 | x1.007 / 0.989 / 1.008 / 1.012 | — |
+| autocorrelation deficit, lag 1 / 6 / 24 h | -0.08 / -0.30 / -0.33 | -0.03 / -0.09 / -0.06 | — |
+| within-winter temperature coupling | 0.227 | 0.193 | 0.343 |
+
+This cube is a single realization, so its seasonal figures scatter more than the held-out table's (DJF amplitude
+x0.86 here, x0.96 there). The national p95 shortfall of the first regeneration (x0.962, before W7) is gone.
+
+**Step iv on the regenerated cube, against what the fleet actually produces** (res_model's calibrated onshore and
+offshore conversions with the engine's level anchor, driven by the cube's French 100 m wind; observed = RTE
+production 2019-2025, each profile normalised by its mean):
+
+| | peak | first-harmonic phase | energy share 10-15 UTC | energy share 17-22 UTC | profile corr vs observed |
+|---|---|---|---|---|---|
+| observed onshore | 21 UTC | 20.2 h | 0.246 | 0.264 | — |
+| pre-fix cube, onshore | 14 UTC | 13.7 h | 0.290 | 0.244 | -0.10 |
+| regenerated cube, onshore | 20 UTC | 20.2 h | 0.241 | 0.268 | 0.94 |
+| observed offshore | 20 UTC | 21.6 h | 0.230 | 0.271 | — |
+| pre-fix cube, offshore | 14 UTC | 13.7 h | 0.284 | 0.246 | -0.51 |
+| regenerated cube, offshore | 21 UTC | 21.0 h | 0.237 | 0.269 | 0.91 |
+
+In price terms: the pre-fix field put about 4.5 points too much onshore energy into the solar window and 2 points
+too little into the evening ramp; both are now within half a point of observed.
+
+The spread, against the same conversion driven by ERA5 100 m wind at the same 42 stations (2015-2026, hourly
+onshore CF):
+
+| onshore CF | std | p05 | p50 | p95 | p99 | DJF p95 | daily-mean std | hour-to-hour step std |
+|---|---|---|---|---|---|---|---|---|
+| ERA5-driven | 0.162 | 0.043 | 0.162 | 0.567 | 0.727 | 0.680 | 0.150 | 0.018 |
+| pre-fix cube | 0.153 | 0.046 | 0.169 | 0.539 | 0.693 | 0.607 | 0.114 | 0.065 |
+| regenerated cube | 0.163 | 0.041 | 0.163 | 0.568 | 0.724 | 0.670 | 0.143 | 0.043 |
+
+The step std is the one gap left in this table: hourly ramps are 2.4x ERA5's (3.6x before).
+
+**Consequence downstream:** every cube simulated before this date carries the wrong 100 m diurnal cycle — the
+default `output/simulation.nc`, every Monte-Carlo draw cube, and `archive/REFERENCE_WEATHER_20Y.nc`, which was
+stitched from draw cubes. See `dispatch_model/DECISIONS.md` (2026-09-14) for what that invalidates.

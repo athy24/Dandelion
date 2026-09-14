@@ -88,21 +88,33 @@ def _set_ranges(mat: np.ndarray, urow: dict, events: pd.DataFrame, hstart, n_day
                 state_mat[ui, i0:i1] = state_code
 
 
+def _operating_mask(registry, days) -> np.ndarray:
+    """[n_units, n_days] bool — is the unit inside its [commissioning, closure) window that day?
+
+    THE single authority for the operating window. `_assemble_draw` zeroes availability outside it and
+    `project` sums `installed_mw` inside it, so the numerator and the denominator of the availability
+    fraction cannot describe different fleets. They did: the consumer divided by the annual MAXIMUM of its
+    own numerator, and since the best day of a year is never a full-availability day that inflated the
+    fraction by ~6.8 points — about 4.3 GW of French nuclear never taken out of the dispatch stack.
+    """
+    yrs = days.year.to_numpy()
+    comm = pd.to_numeric(registry["commissioning_year"], errors="coerce").to_numpy()
+    clos = pd.to_numeric(registry["closure_year"], errors="coerce").to_numpy()
+    mask = np.ones((len(registry), len(yrs)), dtype=bool)
+    for ui in range(len(registry)):
+        if np.isfinite(comm[ui]):
+            mask[ui, yrs < comm[ui]] = False
+        if np.isfinite(clos[ui]):
+            mask[ui, yrs >= clos[ui]] = False
+    return mask
+
+
 def _assemble_draw(config, model, registry, draw, temp_daily, hstart, days, n_days):
     urow = {u: i for i, u in enumerate(registry["unit_id"])}
     cap = registry["capacity_mw"].to_numpy(float)
     avail = np.repeat(cap[:, None], n_days, axis=1)                 # start at full capacity
     state = np.zeros((len(registry), n_days), dtype=np.int8)
-
-    # operating window: zero outside [commissioning, closure]
-    yrs = days.year.to_numpy()
-    comm = pd.to_numeric(registry["commissioning_year"], errors="coerce").to_numpy()
-    clos = pd.to_numeric(registry["closure_year"], errors="coerce").to_numpy()
-    for ui in range(len(registry)):
-        if np.isfinite(comm[ui]):
-            avail[ui, yrs < comm[ui]] = 0.0
-        if np.isfinite(clos[ui]):
-            avail[ui, yrs >= clos[ui]] = 0.0
+    avail[~_operating_mask(registry, days)] = 0.0                   # outside [commissioning, closure)
 
     planned = schedule_planned(config, model, registry, draw=draw)
     forced = simulate_forced(config, model, registry, draw=draw, planned=planned,
@@ -163,6 +175,12 @@ def project(config: Config, n_draws: int | None = None, layer: str = "availabili
     techs = sorted(set(tech))
     nuc_mask = registry["technology"].to_numpy() == "nuclear"
 
+    # Installed baseline per unit-day under the SAME window `_assemble_draw` applies — draw-independent,
+    # so computed once outside the loop. Written next to `available_mw` because the availability FRACTION
+    # is only well defined where both come from one fleet definition; a consumer left to guess the
+    # denominator guessed the annual maximum of the numerator.
+    installed = registry["capacity_mw"].to_numpy(float)[:, None] * _operating_mask(registry, days)
+
     tech_frames, nuc_frames, ic_frames = [], [], []
     from powersim_core.progress import Progress
     _prog = Progress(len(ids), 'availability draws')
@@ -173,7 +191,8 @@ def project(config: Config, n_draws: int | None = None, layer: str = "availabili
         for t in techs:
             m = tech == t
             tech_frames.append(pd.DataFrame({"draw": d, "day": days, "technology": t,
-                                             "available_mw": avail[m].sum(axis=0).round(1)}))
+                                             "available_mw": avail[m].sum(axis=0).round(1),
+                                             "installed_mw": installed[m].sum(axis=0).round(1)}))
         # per-nuclear-unit daily detail (state + available)
         ni = np.where(nuc_mask)[0]
         for ui in ni:
@@ -214,7 +233,12 @@ def _print_summary(by_tech, registry, nd, outdir):
     nuc = by_tech[by_tech["technology"] == "nuclear"]
     nuc_cap = registry.loc[(registry["technology"] == "nuclear")
                            & registry["closure_year"].isna(), "capacity_mw"].sum()
-    kd_by_draw = nuc.groupby("draw")["available_mw"].mean() / nuc_cap
+    # against the SAME operating window the fraction uses, not a horizon-constant denominator that drops
+    # every unit carrying a closure year. With the retirement schedule synced from the dispatch that
+    # denominator lost 22 reactors and reported Kd 0.900 for a fleet running at 0.74.
+    kd_by_draw = (nuc.groupby("draw")["available_mw"].mean()
+                  / (nuc.groupby("draw")["installed_mw"].mean()
+                     if "installed_mw" in nuc.columns else nuc_cap))
     print(f"[project] {nd} draws -> {outdir}")
     print(f"[project] nuclear Kd across draws: mean {kd_by_draw.mean():.3f} "
           f"[{kd_by_draw.min():.3f}, {kd_by_draw.max():.3f}] (low = common-mode draws)")

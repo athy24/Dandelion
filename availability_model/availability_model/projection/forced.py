@@ -42,11 +42,29 @@ def simulate_forced(config: Config, model: CalibratedAvailability, registry: pd.
     rng = substream(config.seed, draw, "forced")          # F4: single RNG authority (SeedSequence)
     pintervals = _planned_intervals(planned)
 
+    # AGE IS PER UNIT, NOT PER CALENDAR YEAR. The creep used to accrue as `y - ref_year`, i.e. purely with
+    # the clock, so every reactor aged at the same rate from the same instant no matter when it was built.
+    # For the existing fleet that is roughly right — they were all commissioned within a decade and the
+    # base rate is calibrated on them. For a unit commissioned in 2038 it is nonsense: an EPR2 would carry
+    # ~25 years of age creep by 2046, having run for eight. That is the mechanism by which "the new units
+    # get the same outage rate as the existing fleet", and it is fixed by measuring age from the unit's own
+    # commissioning against the age the CALIBRATED fleet had when it was calibrated.
+    _com = pd.to_numeric(registry.get("commissioning_year"), errors="coerce")
+    _nuc = registry["technology"] == "nuclear"
+    _ref_age = float((ref_year - _com[_nuc]).mean()) if _nuc.any() and _com[_nuc].notna().any() else 0.0
+
     rows = []
     for _, u in registry.iterrows():
-        fp = model.forced.get(u["technology"])
-        if not fp or pd.notna(u["closure_year"]):
+        fp = (model.forced.get(f"{u['technology']}_{u.get('palier')}")     # per-class override if present
+              or model.forced.get(u["technology"]))
+        # CLOSED BEFORE THE HORIZON, not "has a closure year at all". The old test skipped any unit
+        # carrying one, which was harmless while Fessenheim (2020) was the only closure — and would have
+        # silently removed forced outages for the WHOLE horizon from every reactor the retirement schedule
+        # touches, the moment closures were added.
+        _clos = pd.to_numeric(pd.Series([u["closure_year"]]), errors="coerce").iloc[0]
+        if not fp or (pd.notna(_clos) and _clos <= y0):
             continue
+        _uc = _com.get(u.name, float("nan"))
         base = float(fp["freq_per_unit_year"])
         slope = float(fp.get("trend_slope_pct_yr", 0.0))
         corr = float(uc.get(u["technology"], 0.0))                  # ±10% user correction (D2)
@@ -55,9 +73,13 @@ def simulate_forced(config: Config, model: CalibratedAvailability, registry: pd.
         mu, sig = fp["dur_lognorm_mu"], fp["dur_lognorm_sigma"]
         planned_u = pintervals.get(u["unit_id"], [])
         for y in range(y0, y1 + 1):
-            # age creep accrues only BEYOND the calibration midpoint (the base rate already reflects the
-            # fleet's age during calibration); otherwise old reactors would be double-aged at y0.
-            extra_age = max(0, y - ref_year)
+            # Creep accrues only once a unit is OLDER than the calibrated fleet was when calibrated, so
+            # the base rate is not double-counted. A unit whose commissioning year is unknown falls back
+            # to the old calendar rule, which is what the existing fleet has always had.
+            if pd.notna(_uc):
+                extra_age = max(0.0, (y - float(_uc)) - _ref_age)
+            else:
+                extra_age = max(0, y - ref_year)
             rate = base * (1 + eff_slope / 100 * (y - y0)) * (1 + _AGE_CREEP_PCT_YR / 100 * extra_age) * level_factor
             n = rng.poisson(max(0.0, rate))
             for _ in range(n):

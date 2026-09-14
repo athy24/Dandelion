@@ -69,8 +69,20 @@ def _append_wind100(cube: xr.DataArray, config: Config, rng: np.random.Generator
     from pathlib import Path
     if not Path(path).exists():
         return cube
-    from .wind100 import Wind100Model
-    return Wind100Model.load(path).append(cube, rng)
+    from .wind100 import Wind100Model, generator_identity
+    m = Wind100Model.load(path)
+    # The recalibration corrects THIS generator's damped 10 m diurnal cycle; applied to another generator fit it
+    # is a guess, and it degrades silently. Refuse instead: fit_wind100.py re-estimates it in one run. Checked only
+    # when the model co-generates at least one station: on a cube with no fitted station (the synthetic smoke test)
+    # `append` returns the cube untouched, and there is nothing to misapply.
+    applies = any(str(s) in m.station_ids for s in cube["station"].values)
+    if applies and m.recal is not None and m.recal_generator:
+        current = generator_identity(config.models_dir)
+        if current != m.recal_generator:
+            raise RuntimeError(
+                f"wind100 recalibration was estimated for 10 m generator {m.recal_generator}, but "
+                f"{config.models_dir} holds {current}: re-run weathergen/scripts/fit_wind100.py")
+    return m.append(cube, rng)
 
 
 def _derive_humidity(cube: xr.DataArray) -> xr.DataArray:

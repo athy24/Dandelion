@@ -54,9 +54,16 @@ Key choices (detail in `weathergen/METHODOLOGY.md` / `DECISIONS.md`):
   marginals.
 - The **climate-change trend is imposed externally** (CMIP6 quantile deltas, quantile-delta mapping),
   never estimated from the short record — tail intensification comes from the climate model.
-- 100 m wind is **co-generated** with 10 m via a fitted transfer so wind-power conversion downstream sees
-  hub-height wind coherent with the surface field (see `weathergen/WIND_TEMP_COUPLING.md` for the
-  temperature-coupling investigation and why the shipped model is transfer-only).
+- 100 m wind is **co-generated** with 10 m so wind-power conversion downstream sees hub-height wind coherent
+  with the surface field. The transfer's intercept AND shear exponent vary with season and local solar hour: at
+  night the surface layer decouples, so 100 m wind strengthens while 10 m wind weakens. Without those terms the
+  co-generated field peaked in the early afternoon with the 10 m wind, where ERA5 and observed French wind
+  production peak at 20-21 UTC (2026-09-14). The residual is a spatially-correlated AR(1) plus a persistent
+  national common factor, and a smooth national recalibration matches the co-generated climatology, driven by
+  the generator's own 10 m wind, to ERA5 — so the transfer and the 10 m generator are refit as a pair
+  (`weathergen/scripts/fit_wind100.py`). See `weathergen/DECISIONS.md` ("wind100 diurnal shear"), and
+  `weathergen/WIND_TEMP_COUPLING.md` for the temperature-coupling investigation and why the shipped model
+  carries no temperature term.
 
 One RNG realization of the cube is the single weather input shared by demand and res, so their draws are
 **coherent** (the same weather drives both load and renewables).

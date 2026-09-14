@@ -11,6 +11,7 @@ fit-once/simulate-many design weathergen was built for.
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 import numpy as np
@@ -46,10 +47,12 @@ def draw_seed(master_seed: int, draw: int) -> int:
     return int(np.random.SeedSequence([int(master_seed), int(draw)]).generate_state(1)[0])
 
 
-def generate_cube(draw: int, out_path: Path, master_seed: int = 20260629) -> Path:
-    """Simulate one 20-year weather trajectory to `out_path`. Returns the path."""
-    import xarray as xr
+def generate_cube(draw: int, out_path: Path, master_seed: int = 20260629, model_fp: str | None = None) -> Path:
+    """Simulate one 20-year weather trajectory to `out_path`. Returns the path.
 
+    Written to a temp name and renamed, so a kill mid-write never leaves a partial cube at `out_path`; stamped
+    with `model_fp` so a caller can refuse to reuse a cube produced by another model."""
+    import xarray as xr
     from weathergen.simulate import simulate
     model, cfg = _fitted()
     sim = simulate(model, cfg, np.random.default_rng(draw_seed(master_seed, draw)))
@@ -62,7 +65,11 @@ def generate_cube(draw: int, out_path: Path, master_seed: int = 20260629) -> Pat
     ds = xr.Dataset({"obs": sim})
     ds.attrs.update({"mc_draw": int(draw), "mc_master_seed": int(master_seed),
                      "seed": draw_seed(master_seed, draw)})
-    ds.to_netcdf(out_path)
+    if model_fp:
+        ds.attrs["model_fp"] = str(model_fp)
+    tmp = out_path.with_name(f".{out_path.name}.tmp")
+    ds.to_netcdf(tmp)
+    os.replace(tmp, out_path)
     return out_path
 
 
@@ -73,7 +80,7 @@ _HDD_BASE, _CDD_BASE = 17.0, 18.0
 def weather_summary(cube_path: Path) -> pd.DataFrame:
     """Per-year national summary of one draw — the tab that tells you WHICH weather produced a price path.
 
-    Station-mean hourly series reduced to the aggregates that actually drive this model: temperature (and
+    French station-mean hourly series reduced to the aggregates that actually drive this model: temperature (and
     its degree-days, which drive demand), wind at 100 m (the turbine hub height step iv uses), a solar
     proxy from cloud cover, and precipitation (which sets hydro wetness)."""
     import xarray as xr
@@ -87,6 +94,13 @@ def weather_summary(cube_path: Path) -> pd.DataFrame:
             time = time.tz_localize("UTC")
         vmap = {str(v): i for i, v in enumerate(da["variable"].values)}
         arr = da.transpose("time", "station", "variable").values
+        # FRANCE ONLY. Since the neighbour extension the cube carries 76 European stations, and averaging all of
+        # them labelled a pan-European mean as the draw's French weather (100 m wind 5.58 vs 5.69 m/s,
+        # temperature 12.4 vs 13.2 °C on the 2026-08 cube). A France-only cube has no `zone` coord: used whole.
+        if "zone" in da.coords:
+            fr = np.asarray(da["zone"].values).astype(str) == "FR"
+            if fr.any():
+                arr = arr[:, fr, :]
         nat = {v: np.nanmean(arr[:, :, i], axis=1) for v, i in vmap.items()}
     finally:
         ds.close()
