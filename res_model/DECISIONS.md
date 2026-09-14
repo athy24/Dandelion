@@ -317,6 +317,46 @@ seasonal envelope is right.
   is stale. Partitions now record their source cube in `source_cube.json` and rebuild when it differs
   (`powersim_core/weather_cube.py`).
 
+## Offshore projection saturated below rated wind (2026-09-14)
+
+**The defect.** `CalibratedRes.apply_offshore` applied the fitted offshore level scale (`cf_scale` 1.1215) to
+the loss-free farm curve (`availability=1.0, wake_loss=0.0`). But the scale was fitted
+(`calibration/historical.py`, `fit.py`) on `offshore_farm_cf` WITH its default availability 0.94 and wake
+loss 0.10, a product of 0.846. So in projection the curve was multiplied by 1.12 and clipped at 1.0. On the
+default cube 12.3 % of hours hit that clip, below rated wind speed. The per-draw level anchor (scale 0.862)
+then turned the clip into a flat ceiling at 0.862 CF: p90, p95 and p99 all equal, with 25 % of winter hours
+on it. The defect predates the wind100 refit; restoring the winter upper tail only put more hours on the
+ceiling.
+
+**The fix, opt-in.** `POWERSIM_RES_OFFSHORE_LOSSES=1`, read at every call, applies the losses the scale was
+fitted with.
+- **Effect:** raw CF peaks at 0.949 and nothing is clipped. The anchor scale becomes 0.998, so the projection
+  lands on the calibrated level with essentially no correction.
+- **Default:** off, keeping the legacy form, so the golden `res/production` is unchanged.
+- **Who sets it:** `dispatch_model/scripts/run_montecarlo.py` for every draw, and `run_sensitivities.py`
+  for every variant.
+
+Measured on the default cube (French offshore, level-anchored, 2027-2046), against the calibrated historical
+fleet CF (ERA5 wind at the farm points, 2024 onward) and observed RTE CF (2024 onward):
+
+| offshore CF | std | p90 | p95 | p99 | max | hours at max | winter hours at max | winter p95 | daily-mean std | profile corr vs observed |
+|---|---|---|---|---|---|---|---|---|---|---|
+| projected, legacy | 0.269 | 0.862 | 0.862 | 0.862 | 0.862 | 12.3 % | 25.0 % | 0.862 | 0.235 | 0.915 |
+| projected, flag set | 0.278 | 0.880 | 0.935 | 0.947 | 0.947 | 0.6 % | 1.4 % | 0.946 | 0.244 | 0.905 |
+| calibrated history | 0.288 | 0.863 | 0.933 | 0.949 | 0.949 | 0.4 % | 1.1 % | 0.948 | 0.256 | 0.968 |
+| observed RTE | 0.294 | 0.845 | 0.928 | 1.017 | 1.050 | 0.0 % | 0.1 % | 0.949 | 0.263 | — |
+
+**Reading the table.**
+- **Mean:** 0.418 in every projected and historical row, by construction (observed: 0.382 over 2024+).
+- **Upper tail:** the flag changes only this. The plateau below rated wind is gone, and p95, p99 and the
+  winter p95 land on the calibrated history.
+- **Recorded, not hidden:** the diurnal profile correlation with observed production moves 0.915 → 0.905.
+- **Remaining gap to history** (std 0.278 against 0.288, daily-mean std 0.244 against 0.256): most likely
+  the national-wind proxy. The projection drives one farm curve with national 100 m wind × a constant
+  offshore ratio, where history averages each farm's own ERA5 wind. Not tested.
+
+Tests: `tests/test_offshore_losses.py` (2).
+
 ## Build plan (phase-by-phase, sign-off between each)
 
 0 scaffold ✓ · 1 io loaders + QC + ERA5 · 2 transfer (station→ERA5-100 m, GHI) · 3 conversion chains

@@ -289,8 +289,8 @@ far as it was measured.
   - 2046 energy: 760.0 TWh on the PPE3 tabs, against 567.1 TWh on the live ones.
 
 **Consequence for prices.** The Monte-Carlo reads the same tabs (`weather_shapes.fr_draw` → `project_trajectory`),
-so the old and new ensembles price the same moderated demand. Whether 590 TWh is the intended reference is a
-scenario question; it is not changed here.
+so the old and new ensembles price the same moderated demand. It is kept as the reference (decision,
+2026-09-14): the 760 TWh path is PPE3's high case, not a central scenario.
 
 Gate at recapture: `tools/golden.py check` identical. Suites: powersim_core 29, weathergen 35, demand 24, res 30,
 availability 33, dispatch 380.

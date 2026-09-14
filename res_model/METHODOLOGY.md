@@ -38,7 +38,10 @@ recalibrated** to reproduce observed national capacity factors and their distrib
 - **Offshore.** Coastal-station → farm-site 100 m via ERA5-estimated ratios; farm power curves; short
   FR history (~2 yr) → the CF anchor (~40 %) is corroborated against published operator/RTE ranges and
   its **uncertainty is documented** (§5). The modelled fleet is **time-varying** (a farm contributes only
-  once commissioned) — fixing a large early bias.
+  once commissioned) — fixing a large early bias. In projection, `POWERSIM_RES_OFFSHORE_LOSSES=1` (set by the
+  Monte-Carlo and the sensitivities) applies the farm availability and wake loss the offshore level scale was
+  fitted with. Without it, the loss-free curve × 1.12 clips at 1.0 below rated wind, and the level anchor
+  turns the clip into a flat ceiling on 25 % of winter hours (DECISIONS, 2026-09-14).
 
 ## 3. Conversion chains (recalibrated)
 

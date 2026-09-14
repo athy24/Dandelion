@@ -121,6 +121,9 @@ def run_draw(draw: int, out_root: Path, master_seed: int, keep_cube: bool,
     env["POWERSIM_WEATHER_CUBE"] = str((_HERE.parent / cube).resolve())
     env["DISPATCH_CAPTURE_DISPATCH"] = "1"
     env["DISPATCH_AVAIL_WDRAW"] = str(draw)      # this draw's availability, not the shared tables
+    # step iv applies the offshore losses its level scale was fitted with, so the fleet does not saturate below
+    # rated wind (res_model/DECISIONS.md, 2026-09-14). Set for every draw: one offshore conversion per ensemble.
+    env["POWERSIM_RES_OFFSHORE_LOSSES"] = "1"
 
     # step v on THIS draw's weather: one availability realization per weather realization
     _run([sys.executable, "-u", "-X", "utf8", "-W", "ignore", "-c",

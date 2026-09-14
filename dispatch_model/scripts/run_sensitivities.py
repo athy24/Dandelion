@@ -53,6 +53,7 @@ def _base_env() -> dict:
     env["POWERSIM_WEATHER_CUBE"] = str(CUBE)
     env["DISPATCH_AVAIL_WDRAW"] = str(AVAIL_WDRAW)
     env["DISPATCH_CAPTURE_DISPATCH"] = "1"
+    env["POWERSIM_RES_OFFSHORE_LOSSES"] = "1"              # the ensemble's offshore conversion (run_montecarlo)
     env.pop("POWERSIM_SCENARIOS", None)                    # each variant sets its own; never inherit one
     return env
 

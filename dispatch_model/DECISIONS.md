@@ -1507,7 +1507,9 @@ engine.
   12 August tabs (8be1a62, PPE3) the same engine gives 760 TWh in 2046, against 567 on today's.
 
 So "how the model has been pricing all along" means since 20 August, and the choice is only now documented.
-Whether 590 TWh is the intended reference is a scenario decision; it is not changed here.
+
+**Kept as the reference (decision, 2026-09-14).** The 760 TWh path of 8be1a62 is PPE3's HIGH case, not a
+central scenario; the 590 TWh trajectory is the more credible reference, and the new ensemble prices it.
 
 Against 556, an absolute 700 TWh target would have been a **26 % increase** — the opposite sign of the
 sensitivity asked for. So the two variants are built as the PROPORTIONAL cuts that 700 and 650 represent
@@ -1982,3 +1984,7 @@ The truncated-cube guard in `run_all.ps1` now recurses into the fingerprinted wo
 - **`reports/irr_nancy_mc21/site_weather.py`**, the other session's IRR study, re-implements the pre-fix 100 m formula as `a + b·log w10` and ignores the refit's terms. Its guard checks only `c is None`. It is flagged, not edited. After its per-site quantile mapping the effect on capture timing is small (hourly CF correlation 0.985), but its docstring's claim of an exact replay no longer holds.
 
 Tests: `tests/test_montecarlo_relaunch.py` (5), `tests/test_sensitivity_markers.py` (2), the updated `tests/test_model_fingerprint.py`, and `powersim_core/tests/test_cache_identity.py`.
+
+### The ensemble's offshore conversion
+
+`run_montecarlo.py` sets `POWERSIM_RES_OFFSHORE_LOSSES=1` for every draw, and `run_sensitivities.py` for every variant. With it, step iv applies the availability and wake loss its offshore level scale was fitted with. Without it, the loss-free curve is clipped at 1.0 and held 25 % of winter hours on a flat ceiling (`res_model/DECISIONS.md`, 2026-09-14). Both scripts are part of the digest, so the ensemble's fingerprint moves with the change. A standalone `run_projection_20y.py` run without the flag still prices the legacy form.

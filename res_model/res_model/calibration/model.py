@@ -8,6 +8,7 @@ Serialisable; consumed by the projection engine (Phase 6).
 """
 from __future__ import annotations
 
+import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -51,10 +52,22 @@ class CalibratedRes:
         return self._monthly(cf, self.onshore).rename("wind_onshore")
 
     def apply_offshore(self, wind100: pd.Series, specific_power: float | None = None) -> pd.Series:
-        cf = offshore_farm_cf(wind100, specific_power=specific_power or self.offshore["specific_power"],
-                              smoothing_ms=self.offshore["smoothing_ms"], availability=1.0,
-                              wake_loss=0.0) * self.offshore["cf_scale"]
-        return self._monthly(cf, self.offshore).rename("wind_offshore")
+        """Offshore CF from the national offshore-site 100 m wind.
+
+        `cf_scale` is fitted (calibration/fit.py) on `offshore_farm_cf` WITH its default availability and wake
+        loss, whose product is 0.846. Applied, as it always has been here, to the loss-free curve, it multiplies
+        the curve by ~1.12 and the result is clipped at 1.0: the projected fleet saturates below rated wind
+        speed, and the per-draw level anchor turns that clip into a flat ceiling on a large share of winter
+        hours (measured in res_model/DECISIONS.md, 2026-09-14). With `POWERSIM_RES_OFFSHORE_LOSSES=1`, read at
+        every call, the losses the scale was fitted with are applied, so the curve reaches its plateau only at
+        rated speed. The anchored mean is the same either way; the upper tail is not. Off by default."""
+        sp = specific_power or self.offshore["specific_power"]
+        if os.environ.get("POWERSIM_RES_OFFSHORE_LOSSES", "").strip().lower() in ("1", "true", "yes"):
+            cf = offshore_farm_cf(wind100, specific_power=sp, smoothing_ms=self.offshore["smoothing_ms"])
+        else:
+            cf = offshore_farm_cf(wind100, specific_power=sp, smoothing_ms=self.offshore["smoothing_ms"],
+                                  availability=1.0, wake_loss=0.0)
+        return self._monthly(cf * self.offshore["cf_scale"], self.offshore).rename("wind_offshore")
 
     def apply_hydro(self, precip_nat: pd.Series, temp_nat: pd.Series) -> pd.Series:
         """ROR CF from the weather-driven lumped hydrological blend (see calibration/hydro.py):
