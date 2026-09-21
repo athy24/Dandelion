@@ -2259,6 +2259,36 @@ Against that line, the median capture price across the draws is:
 - level with it in 2031;
 - above it from 2032, by 11-21 EUR/MWh from 2036.
 
+### The electrolyser's cost of hydrogen on each year's prices (2026-09-21)
+
+`scripts/electrolyser_lcoh.py` prices a kilogram of hydrogen, year by year, for an electrolyser that faces that year's French hourly spot prices in every year of a 20-year life. The outputs are in `reports/sens/charts/`: `electrolyser_lcoh.png` and `.csv`, every draw-year in `electrolyser_lcoh_mc_draws.csv`, and the inputs and rules in `electrolyser_lcoh_assumptions.json`.
+
+The user set the assumptions: capex 2 MEUR/MW, 20-year amortisation at 8 % WACC (CRF 0.1019, 203.7 kEUR per MW-year) and 55 kWh/kg. Only capex and wholesale power are counted. There is no O&M, stack replacement, grid tariff, tax, water, compression, storage or transport, and no ramping limit or minimum load.
+
+- **The optimum.** The capital charge does not depend on which hours are run, so the best k hours are always the k cheapest. The script keeps the k that minimises (capital charge + cost of those hours) / hydrogen made. Negative prices count as earnings. It assumes perfect foresight of the year's prices, and the electrolyser's own demand does not move them.
+- **8 000 h a year** (user request): read as the 8 000 cheapest hours, with the same foresight. The gap to the optimum is then the value of flexibility and nothing else. A plant that cannot choose the 760 hours it skips costs more, so this line is a lower bound.
+- **Short years.** A year counts its priced hours: 8 736, and 8 640 in 2046. The capital charge and the 8 000 h are prorated to them (`hours_per_year` restates the optimum on 8 760 hours).
+- **Monte-Carlo.** The quantiles are taken over the 50 draws of `mc50-3724001c75e0`, on each draw's own result. The chart's band is the flexible case only. The CSV also gives the 8 000 h case's spread (`mc_fixed_*`).
+
+On the reference scenario, in EUR/kg:
+
+| | 2027 | 2029 | 2036 | 2040 | 2046 |
+|---|---|---|---|---|---|
+| Optimal flexible | 3.73 | 2.95 | 2.32 | 2.50 | 2.65 |
+| Share of the year run | 45 % | 53 % | 62 % | 55 % | 51 % |
+| 8 000 h a year | 5.39 | 3.70 | 3.84 | 4.30 | 4.96 |
+| Gap | 1.66 | 0.75 | 1.52 | 1.80 | 2.31 |
+
+At 8 000 h the capex share falls to 1.40 EUR/kg, against 2.1-2.9 for the optimum. But the electricity costs 42-73 EUR/MWh on average, against 2-18. From 2036 the gap between cheap and expensive hours widens, so the 8 000 h cost climbs back towards 5 EUR/kg while the optimum stays near 2.5.
+
+The 10th-90th percentile across the draws:
+- flexible optimum: 3.43-4.52 EUR/kg in 2027, then 0.2-0.4 either side of the median from 2035;
+- 8 000 h: 4.95-5.91 in 2027 and 4.19-5.52 in 2046.
+
+The reference was chosen to sit central on the mean FR price, not on these costs. The reference 8 000 h line lies inside its own spread every year, between its 36th and 66th percentile, and 0.22 EUR/kg above its median in 2032.
+
+Tests: `tests/test_electrolyser_lcoh.py` checks the optimum against a brute-force search over every subset of hours, and the 8 000 h case against the k cheapest hours.
+
 ### The second adversarial review (2026-09-17), applied on 2026-09-21
 
 Four reviewers each ran with a verifier. They confirmed 23 findings and refuted 2. All code findings are fixed. None concerned a path the weekend actually took.
