@@ -3,10 +3,11 @@ name = "powersim-core"
 version = "0.1.0"
 description = "Shared library for the powersim price-modelling pipeline (glossary, time grid, RNG, weather cube, metadata)."
 requires-python = ">=3.11"
+license = "GPL-3.0-or-later"
 dependencies = ["numpy", "pandas", "xarray", "pyarrow", "duckdb", "pandera"]
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
