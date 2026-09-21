@@ -13,11 +13,15 @@ Tabs:
   Negative hours   variant x year x zone: hours <= 0 and delta
   Congestion       variant x year x border: congestion rent and delta
   Ranking          mean over the horizon of the FR delta, ordered -- which assumption matters most
+  Baseline gate    per year: the re-run baseline against its draw's own run and the ensemble mean (FR)
 
 Runs on whatever is complete, and says how many that is; it does not wait for the whole set. Complete means
 complete UNDER THIS MODEL: a variant counts only when its `.sens_complete` names the fingerprint
-`run_sensitivities.variant_fingerprints` gives it now, so results of an earlier model or reference weather that
-have not yet been moved aside are left out, and named.
+`run_sensitivities.variant_fingerprints` gives it now, so results of an earlier model or reference that have not
+yet been moved aside are left out, and named. The Notice reports the baseline gate (reference_gate.py) -- whether it
+passed, the worst, mean and horizon gaps, and on a failure the years that failed -- and the Baseline gate tab gives
+every year. The demand figures of the Notice are computed from the measured reference (fr_demand_ref.json) and the
+variants' own definitions (make_sensitivities.DEMAND_REDUCTIONS), not typed in.
 
     python -X utf8 -W ignore scripts/consolidate_sensitivities.py
 """
@@ -26,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import textwrap
 from pathlib import Path
 
 import pandas as pd
@@ -122,8 +127,63 @@ def main() -> int:
         rank = rank.reindex(rank["mean_delta_eur_mwh"].abs().sort_values(ascending=False).index)
         rank = rank[["variant", "label", "mean_delta_eur_mwh", "max_delta_eur_mwh", "mean_pct"]].round(2)
 
+    import reference_gate as rgate
+    import reference_scenario as refsc
+    sel, meta = refsc.load_map()
+    fps = rs.variant_fingerprints(list(man.values()), a.start, a.end, a.n_weeks)
+    stamp = rgate.load(SRC / BASE, fps[BASE]) if BASE in fps else None
+    gate_tab = pd.DataFrame()
+    if stamp is None:
+        gate_lines = ["THE BASELINE GATE HAS NOT BEEN PASSED for this reference: no current verdict on s00_baseline."]
+        print("WARNING: no current baseline gate verdict - the set should not have been run")
+    else:
+        gaps = {int(y): float(g) for y, g in stamp["gaps"].items()}
+        stats = (f"worst |gap| {stamp['max_abs_gap']:.2f} EUR/MWh, mean |gap| "
+                 f"{sum(abs(g) for g in gaps.values()) / max(len(gaps), 1):.2f}, horizon "
+                 f"{sum(gaps.values()) / max(len(gaps), 1):+.2f}")
+        if stamp["passed"]:
+            gate_lines = [f"BASELINE GATE PASSED: in every year the re-run baseline's FR annual mean spot is within "
+                          f"{stamp['tolerance_eur_mwh']:.0f} EUR/MWh of the mean of draws {meta['draws'][0]}-"
+                          f"{meta['draws'][-1]} ({stats}; per year in the Baseline gate tab)."]
+        else:
+            gate_lines = [f"BASELINE GATE FAILED: {stats}. Years beyond {stamp['tolerance_eur_mwh']:.0f} EUR/MWh: "
+                          f"{stamp.get('failing_years') or 'none'}; hours mismatch: "
+                          f"{stamp.get('hours_mismatch_years') or 'none'}; missing: "
+                          f"{stamp.get('missing_years') or 'none'}"
+                          + (f"; refused: {stamp['refused']}" if stamp.get("refused") else "")
+                          + ". THESE VARIANTS SHOULD NOT BE READ AGAINST THIS BASELINE."]
+        ck = SRC / BASE / rgate.CHECK
+        if ck.exists():
+            py = json.loads(ck.read_text(encoding="utf-8"))["fr"]["mean_spot"]["per_year"]
+            gate_tab = pd.DataFrame([{"year": int(y), "draw": int(r["draw"]), "reference_rerun": r["ref"],
+                                      "draw_own_run": r["own"], "ensemble_mean": r["ens_mean"],
+                                      "rerun_minus_own": r["ref_minus_own"], "rerun_minus_ensemble": r["ref_minus_ens"],
+                                      "within_tolerance": abs(r["ref_minus_ens"]) <= stamp["tolerance_eur_mwh"],
+                                      "hours": int(r.get("ref_hours", -1))} for y, r in sorted(py.items())])
+    adjusted = meta.get("adjustments", [])
+    adj_years = sorted({int(h["year"]) for h in adjusted})
+    adj_line = (f", and {len(adj_years)} year(s) re-chosen after the baseline gate ("
+                + ", ".join(f"{h['year']}: {h['from_draw']}->{h['to_draw']} [{h['tier']}]" for h in adjusted) + ")."
+                if adjusted else "; no year had to be re-chosen after the baseline gate.")
+
+    import make_sensitivities as msens
+    dref = json.loads(refsc.DEMAND_REF_PATH.read_text(encoding="utf-8"))["fr_demand_twh"]
+    dref = {int(y): float(v) for y, v in dref.items()}
+    y1 = max(dref)
+    cuts = [(red, msens.demand_path(red, dref)[2]) for _vid, red in msens.DEMAND_REDUCTIONS]
+    lvl, lyr = msens.FR_DEMAND_REF_LEVEL, msens.FR_DEMAND_REF_YEAR
+    demand_lines = textwrap.wrap(
+        f"THE FRENCH DEMAND VARIANTS ARE PERCENTAGE REDUCTIONS OF THE {lvl:.0f} TWh REFERENCE. The reference French "
+        f"demand is the step-iii projection of the reference scenario: {dref[min(dref)]:.1f} TWh in {min(dref)}, "
+        f"{dref[y1]:.1f} TWh in {y1} (1 January-26 December: the weather ends there), {lvl:.0f} TWh in {lyr} -- the "
+        f"demand moderation kept as the reference on 2026-09-14. The workbook's dispatch_tyndp demand_twh row, 740 at "
+        f"{lyr}, is read for France and never applied. The variants reduce it by "
+        + " and ".join(f"{r:.2%}" for r, _ in cuts) + f" in {lyr} ("
+        + " and ".join(f"{(1 - r) * lvl:.1f}" for r, _ in cuts) + " TWh), the proportions 700/745 and 650/745 of the "
+        f"original request, the reduction ramping linearly from nothing in {min(dref)}: "
+        + " and ".join(f"-{c:.2%}" for _, c in cuts) + f" in {y1}, the last modelled year.", 104)
     notice = pd.DataFrame({"": [
-        "PriceModeling - sensitivity set on REFERENCE_WEATHER_20Y",
+        "PriceModeling - sensitivity set on the REFERENCE scenario",
         "",
         f"variants complete: {len(dirs)}/{len(man)}; horizon 2027-2046; 12 bidding zones; baseline {BASE}",
         "",
@@ -132,25 +192,21 @@ def main() -> int:
         "So a difference here is the assumption. Each variant's own edits are in its meta.json and in",
         "archive/sensitivities/manifest.json.",
         "",
-        "THE WEATHER IS FIXED, AND IS THE ENSEMBLE'S CENTRE. REFERENCE_WEATHER_20Y takes, for each year,",
-        "the weather of the 50-draw ensemble member whose French annual mean spot sat closest to the",
-        "ensemble mean for that year (worst deviation 0.47 EUR/MWh, most under 0.10). It is NOT a",
-        "physically sampled 20-year sequence: consecutive years come from different draws, so year-to-year",
-        "weather persistence is broken by construction. Read multi-year weather risk from the ensemble.",
+        *textwrap.wrap(
+            "THE REFERENCE IS THE ENSEMBLE'S CENTRE, YEAR BY YEAR. Each year y is taken whole from one Monte-Carlo "
+            f"draw d(y) of ensemble {meta['model_fingerprint']} ({len(set(sel.values()))} draws over 20 years): its "
+            "French demand/RES series, its nuclear and reservoir availability and its neighbours' weather. The draws "
+            f"were chosen on draws {meta['draws'][0]}-{meta['draws'][-1]} (FR annual mean within 1 EUR/MWh of their "
+            "mean, then the neighbours closest to theirs)" + adj_line, 104),
+        *[w for g in gate_lines for w in textwrap.wrap(g, 104)],
+        "It is NOT a physically sampled 20-year sequence: consecutive years come from different draws, so",
+        "year-to-year weather persistence is broken by construction. Read multi-year risk from the ensemble.",
         "",
         "TWO CONVENTIONS, chosen and not deduced:",
         " - commodity variants move the LONG-RUN anchors only (>= 2031); 2027-2030 are quoted forwards.",
         " - RES capacity variants move the PROJECTED years only (>= 2027); 2025-2026 are already built.",
         "",
-        "THE FRENCH DEMAND VARIANTS ARE PROPORTIONAL, NOT ABSOLUTE. They were asked for as 'demand rising",
-        "to only 700 / 650 TWh instead of 740-750'. Step iii actually projects 556 TWh in 2046, some 160",
-        "below the workbook's own stated scenario (dispatch_tyndp demand_twh: 540/616/680 at 2030/35/40,",
-        "740 at 2050) - and that row is read for France and NEVER APPLIED, so the stated path has never",
-        "touched a French price. Against 556 an absolute 700 would be a 26 % INCREASE, so the variants are",
-        "the proportional cuts 700/745 and 650/745 transposed onto the measured path: 523 and 485 TWh in",
-        "2046, growth held to 69 % and 34 % of the reference's, ramping from no change in 2027. The 160 TWh",
-        "gap is a separate defect under its own investigation; every price in this set and in the 50-draw",
-        "ensemble sits on the lower path.",
+        *demand_lines,
         "",
         "ONE VARIANT CANNOT BE READ AS NAMED. The neighbour model carries a single wind aggregate and a",
         "single blended RES growth factor, so 'non-FR solar +10 %' and 'non-FR wind +10 %' both apply a",
@@ -171,6 +227,8 @@ def main() -> int:
         notice.to_excel(w, sheet_name="Notice", index=False)
         if not rank.empty:
             rank.to_excel(w, sheet_name="Ranking", index=False)
+        if not gate_tab.empty:
+            gate_tab.round(3).to_excel(w, sheet_name="Baseline gate", index=False)
         for name, t in (("FR summary", fr_sum), ("FR nuclear", nuc), ("All zones", allz),
                         ("Negative hours", negd), ("Congestion", congd)):
             if t.empty:

@@ -10,9 +10,10 @@ So each variant is loaded THROUGH THE LOADER THE PROJECTION USES, with that vari
 set exactly as the runner sets it, and the quantity it is supposed to move is compared against the
 baseline. A variant whose input does not move fails, and the set does not run.
 
-Environment-flag variants (FR demand, FR nuclear availability) are covered by unit tests instead —
-`test_projection.py::test_demand_scale_*`, `test_fr_availability.py::test_nuc_avail_scale_*` — because
-there is no workbook read to inspect; they are listed here as such rather than silently skipped.
+Environment-flag variants have no workbook cell to inspect. The FR demand paths are probed LIVE through the parser
+the projection uses (`ENV_PROBES`: no change in the horizon's first year, a cut in its last); the FR nuclear
+availability scale lands inside the step-v mapping and is covered by
+`test_fr_availability.py::test_nuc_avail_scale_*` instead -- listed as such rather than silently skipped.
 
     python -u -X utf8 -W ignore scripts/gate_sensitivities.py
 """
@@ -158,9 +159,9 @@ PROBES = {
 #: env-flag variants whose flag IS probed live, as (what, probe, direction). The demand paths must be 1.0
 #: in the horizon's first year (the cut ramps, it does not step) and below 1.0 at its last.
 ENV_PROBES = {
-    "s09_fr_demand_700eq":  [("FR demand factor 2027", probe_demand_factor(2027), 0),
+    "s09_fr_demand_m6":     [("FR demand factor 2027", probe_demand_factor(2027), 0),
                              ("FR demand factor 2046", probe_demand_factor(2046), -1)],
-    "s10a_fr_demand_650eq": [("FR demand factor 2027", probe_demand_factor(2027), 0),
+    "s10a_fr_demand_m13":   [("FR demand factor 2027", probe_demand_factor(2027), 0),
                              ("FR demand factor 2046", probe_demand_factor(2046), -1)],
 }
 

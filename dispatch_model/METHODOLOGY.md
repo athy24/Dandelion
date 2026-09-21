@@ -463,8 +463,11 @@ has to be measured, not extrapolated from the base run.
 
 ## Sensitivity levers, and what a neighbour RES sensitivity can and cannot say (2026-09)
 
-The sensitivity set (`scripts/make_sensitivities.py`, `DECISIONS.md`) varies one assumption at a time on a
-fixed weather trajectory. Of its nineteen variants, fifteen are workbook cells; four are environment flags
+The sensitivity set (`scripts/make_sensitivities.py`, `DECISIONS.md`) varies one assumption at a time on the
+fixed REFERENCE scenario: each year y is taken whole from the Monte-Carlo draw d(y) that priced it at the
+ensemble's centre, with d(y)'s French demand/RES frame, its step-v availability and its neighbours' weather
+(`scripts/reference_scenario.py`, DECISIONS 2026-09-17). The set runs only once the re-run baseline lands within
+1 EUR/MWh of the ensemble's FR annual mean in every year (`scripts/reference_gate.py`). Of its nineteen variants, fifteen are workbook cells; four are environment flags
 on two levers, because the cell that looks right is not read:
 
 - `DISPATCH_DEMAND_SCALE` — a multiplier on a zone's projected demand, applied in `rolling.projection`
@@ -475,24 +478,27 @@ on two levers, because the cell that looks right is not read:
   - The path form exists because a lower-demand scenario does not START lower. 2027 is all but built and
     the divergence accumulates; a flat factor would cut the first projected year as hard as the last,
     which is both a different scenario and a more violent one, since the near years carry the tightest
-    reserve margin. The ramp is taken off a least-squares TREND through the measured reference trajectory
-    rather than off the trajectory itself — the measured series carries the draw's weather (2036 sits above
-    2037), and a factor derived from it would scale that variation along with the level, giving a
-    lower-demand France a flatter response to a cold winter.
+    reserve margin. The two FR demand variants are PERCENTAGE REDUCTIONS of the 590 TWh reference, reached in
+    full in 2050 (-6.04 % and -12.75 %, the proportions 700/745 and 650/745 of the original request) and ramping
+    linearly from nothing in 2027 (-4.99 % and -10.53 % in 2046, the last modelled year;
+    `make_sensitivities.demand_path`). The factor is a smooth function of the year
+    applied to every hour alike, so the reference's weather variation and each hour's weather sensitivity pass
+    through untouched.
 - `DISPATCH_FR_NUC_AVAIL_SCALE` (0.99 = 1 % worse, RELATIVE) — multiplies the step-v availability
   *fraction* in `rolling.fr_availability.nuclear_unavail_daily`, so the derate follows the maintenance
   shape rather than adding flat outage MW. Availability comes from the lake, not from a cell.
 
 Both are read at call time and default to no change.
 
-**THE SCENARIO'S STATED FRENCH DEMAND IS NOT THE DEMAND THAT PRICES.** Measured on REFERENCE_WEATHER_20Y
-at realization 0, step iii projects 477 TWh in 2030, 511 in 2035, 543 in 2040 and 556 in 2046. The same
-workbook's `dispatch_tyndp` `demand_twh` row for FR states 540 / 616 / 680 and 740 at 2050 — PPE3-aligned
-figures, ~716 interpolated at 2046. The gap runs −63 / −105 / −137 / −160 TWh, and it has no effect on any
-price precisely because that row is inert for France. Anyone reading a French price out of this model is
-reading it off the lower path. Diagnosis is tracked separately; the demand sensitivities are therefore
-expressed as PROPORTIONAL cuts against the stated scenario, transposed onto the trajectory the engine
-actually produces, and their labels carry both numbers.
+**THE SCENARIO'S STATED FRENCH DEMAND IS NOT THE DEMAND THAT PRICES.** Measured on the REFERENCE scenario
+(`archive/reference_20y/fr_demand_ref.json`, 2026-09-17), step iii projects 471 TWh in 2030, 507 in 2035,
+541 in 2040 and 571 in 2046 -- a 2046 of 1 January-26 December, where the weather cube ends (579 TWh
+annualised). The same workbook's `dispatch_tyndp` `demand_twh` row for FR states 540 / 616 / 680 and 740 at
+2050 — PPE3-aligned figures, ~716 interpolated at 2046. The gap runs −70 / −109 / −139 / −137 TWh (annualised), and it has no effect on any price precisely because that row is inert for
+France. Anyone reading a French price out of this model is reading it off the lower path. The lower path is
+the demand moderation committed in aba6a5d (590 TWh in 2050), kept as the reference by decision on
+2026-09-14 (`DECISIONS.md`). The demand sensitivities are percentage reductions of that 590 TWh reference (user
+decision 2026-09-17), not TWh targets against the stated scenario.
 
 **A neighbour RES sensitivity moves the LEVEL, not the MIX.** `NeighbourWeatherModel.shape` builds one
 aggregate must-take series per zone — the fitted response to that zone's own wind and clearness, re-anchored

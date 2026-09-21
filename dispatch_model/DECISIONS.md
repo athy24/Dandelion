@@ -1989,3 +1989,315 @@ Tests: `tests/test_montecarlo_relaunch.py` (5), `tests/test_sensitivity_markers.
 ### The ensemble's offshore conversion
 
 `run_montecarlo.py` sets `POWERSIM_RES_OFFSHORE_LOSSES=1` for every draw, and `run_sensitivities.py` for every variant. With it, step iv applies the availability and wake loss its offshore level scale was fitted with. Without it, the loss-free curve is clipped at 1.0 and held 25 % of winter hours on a flat ceiling (`res_model/DECISIONS.md`, 2026-09-14). Both scripts are part of the digest, so the ensemble's fingerprint moves with the change. A standalone `run_projection_20y.py` run without the flag still prices the legacy form.
+
+## Le scénario de référence : chaque année est celle du tirage qui la price au centre de l'ensemble (2026-09-17)
+
+The sensitivity set needs ONE baseline whose prices sit very close to the ensemble average, year by year, so a variant reads as "the ensemble average, with one assumption changed". It is built from the first 30 completed draws (0-29) of ensemble `3724001c75e0`, the relaunch after the 100 m wind fix. The code lives in `scripts/reference_scenario.py`, which documents where every artefact is and how each one is checked, and in the scripts it names.
+
+### The criterion, and what it selected
+
+`scripts/select_reference_weather.py`, chosen by the user: for each year, keep the draws whose FR annual mean spot lies within 1 EUR/MWh of the 30-draw mean; among them, take the draw whose other eleven zones sit closest to their own means (smallest mean squared z-score). If no draw is within 1 EUR/MWh, take the FR-closest draw. Two alternatives were measured and rejected:
+
+- FR alone put FR within 0.16 EUR/MWh a year but left the neighbours where a random draw would sit (mean |z| 0.65).
+- Weighting every zone equally brought the neighbours to 0.36 but moved FR by 2.9 EUR/MWh a year.
+
+The constrained rule gives the figures below. They are ARCHIVE figures: how close each chosen draw was in its own run.
+
+| | mean | max |
+|---|---|---|
+| FR deviation from the 30-draw mean (EUR/MWh) | 0.46 | 0.91 |
+| neighbours, mean abs(z) | 0.48 | |
+
+Over the horizon FR sits +0.13 EUR/MWh above the mean. The map uses 15 distinct draws (2, 3, 4, 5, 7, 8, 9, 10, 11, 14, 15, 19, 20, 28, 29). It is stored in `archive/reference_20y/ref_weather_map.json` and `.meta.json`. Every artefact below carries the meta file's sha256, and the selector never replaces a different map without `--force`: re-running it once the 50 draws are complete would otherwise silently redefine the baseline.
+
+### Why a re-run on a stitched weather cube does not reproduce the chosen draws
+
+The previous construction ran one projection on a cube stitched year by year. Four effects break the reproduction; all were measured on draws 0-29 (investigation of 2026-09-17):
+
+1. **Availability.**
+   - Step v was projected once on the stitched cube, with `draw_ids=[0]`. Every outage stream is seeded by the draw id, so all twenty years carried draw 0's outage calendar.
+   - Measured: annual FR nuclear availability is 1.3 GW off d(y)'s on average, 4.4 GW in the worst year.
+   - Across draws, price moves -3.03 EUR/MWh per GW (corr -0.77). That is about +/-4 EUR/MWh a year, and 10-13 EUR/MWh in the worst years.
+   - Reservoir wetness was also normalised on the stitched cube instead of the draw's own.
+2. **The RES level anchor.** `Projector._anchor` scales each technology's capacity factor to its calibrated mean over the WHOLE 20-year cube. The selected years are less windy than the ensemble, so wind was scaled up in 18-20 of the 20 years. Effect on FR: -1 to -2.5 EUR/MWh.
+3. **Memory across 1 January.** Run-of-river blends about 90 days of rain, and demand features lag temperature by one to two days. In a stitched cube both see another draw's December.
+4. **The availability label.** A stitched partition that keeps its source labels resolves one label for the whole run. The dispatch then finds only that draw's years and prices the other years on the 2019 proxy, with nothing more than a WARNING line.
+
+### What the reference is instead: three artefacts, one map
+
+- **French demand, RES and national temperature: each draw's own frame** (`scripts/run_reference_20y.py`).
+  - For each draw d of the map the wrapper computes `fr_draw(d)` over draw d's whole horizon, from the demand and RES driver caches draw d itself wrote. It keeps year y of d(y)'s frame and places the stitched frame in `weather_shapes._DRAW_CACHE` before `run_projection_20y.main()` starts. The anchor, the run-of-river memory and the demand lags are therefore d(y)'s own.
+  - The caches are the only remaining record of those drivers, because each cube is deleted after its draw. They are snapshotted to `archive/reference_20y/drivers/` (248 MB) only if their sidecar names draw d's cube and they predate the draw's completion marker.
+  - Frames are computed from the snapshot inside a sandbox: every cube read is pointed at a path that does not exist, every freshness check becomes a snapshot check, and every lake write raises.
+  - The model on disk must equal the ensemble's `FINGERPRINT.json`; workbook, environment and run parameters are excluded, since those are what a variant changes.
+  - Frames are cached by the content of the workbook's `demand_*`/`res_*` tabs, so variants that do not touch French demand or RES share the baseline's frames. A frame takes 13-18 s.
+  - **Verified:** in each draw's own dispatch, 77-97 % of the hourly must-take RES values (`FR|res + FR|dump`) equal a value of the recomputed frame to three decimals. Against another draw's frame the match is 0.000 (draws 2 and 10, years 2027/2039/2046).
+- **Step-v availability: the draws' own partitions, stitched** (`scripts/build_reference_availability.py`, `availability_mc/*/wdraw=901`).
+  - For each year y: the `day` rows of year y and the `week_start` rows of year y (the dispatch's reservoir key), each from draw d(y)'s partition. Every row is relabelled 901, which is also the reference run's `--draw`.
+  - Sources must predate their draw's completion marker. Each year's nuclear availability and mean weekly reservoir budget are asserted equal to the source's.
+  - `PROVENANCE.json` beside each table records the map, the sources' and the stitch's sha256. A later rewrite of the partition, such as a step-v re-projection, is refused.
+  - `wdraw=900`, the old single projection of 2026-09-09, is left on disk and no longer read.
+- **Neighbour weather: the stitched cube** (`scripts/build_reference_weather.py`, `archive/REFERENCE_WEATHER_20Y.nc`).
+  - In a reference run this cube is read only for the neighbours' hourly temperature, 10 m wind and cloud cover.
+  - The 15 cubes are regenerated from their seeds after the model check. Each must match the byte size the draw's driver sidecar recorded and every column of the draw's `weather_summary.csv`.
+  - The previous canonical cube is copied aside, not moved: `run_all.ps1` refuses to start without one.
+  - Its 72 h taper either side of each 1 January is the one remaining approximation, together with the solver's wall-clock budgets.
+
+The reference draw index is 901, not 0. Realization 0 holds golden artefacts, and draw 0 of the ensemble has already overwritten them once.
+
+`run_reference_20y.py` also turns five silent fallbacks of `run_projection_20y` into exits:
+- a weather-provider exception, which there falls back to 2019 weather;
+- an empty read of the neighbours' cube weather or of their observed history (`zone_hist.parquet`), either of which there prices every neighbour on the FR proxy;
+- an availability lookup that misses its label, which there uses the 2019 proxy;
+- a markup model that fails to load, which there leaves every price at raw SMC.
+
+It also refuses a `DISPATCH_*`/`POWERSIM_*` switch the ensemble did not run with, unless the variant declares it as its own (`--allow-env`), and refuses to resume an output directory holding years without its own `reference_run.json`.
+
+### Consequences for the sensitivity set
+
+- **The FR demand reference was re-measured on this scenario** (`--measure-demand`, `archive/reference_20y/fr_demand_ref.json`).
+  - It runs from 456.6 TWh in 2027 to 571.4 TWh in 2046. The hard-coded table it replaces came from the pre-fix reference cube at realization 0 and ended at 556.3.
+  - The 700 and 650 cuts now keep 71.0 % and 38.8 % of the reference growth and reach 536.9 and 498.6 TWh in 2046 (-6.04 % and -12.75 %). **Superseded the same day: the variants are percentage reductions of the 590 TWh reference (next section).**
+  - `make_sensitivities.py` refuses a demand reference measured on another map, ensemble or workbook.
+- **The variant workbooks were rebuilt.** `s00_baseline.xlsx` no longer matched `scenarios.xlsx` (`avail_fleet_registry` differed). The build is now idempotent. `.build_stamp.json` records the reference workbook, the demand reference, the map and the script. openpyxl does not save byte-identically, and a variant's fingerprint includes its workbook's sha256, so a rebuild at every driver restart would have moved every finished variant to `_stale/`. For the same reason the demand measurement and the map selection rewrite nothing when their result is unchanged.
+- **`run_sensitivities.py`:**
+  - checks the three artefacts against the map and never re-projects step v;
+  - computes every variant's frames once, alone, before any variant starts;
+  - runs each variant through the wrapper;
+  - keys the variant fingerprint on the map meta, the stitched availability, the driver snapshot and the wrapper's code as well;
+  - checks the baseline as soon as it lands (`check_reference_weather.py`), reporting reproduction (reference minus draw d(y)'s own run) and centre (reference minus the 30-draw mean) to `reference_check.json`.
+
+  The check reports and does not stop the set. The variants are read as differences against s00, which stay meaningful even if s00 sits off the centre, and a stopped weekend cannot be recovered. **Superseded the same day by the user's baseline gate (next section).**
+- **`run_all.ps1` stage 2 is now a chain:** reference weather, then availability, demand reference, workbooks, gate, set. The chain stops at the first failure and the next driver start retries it. It runs only after the Monte-Carlo stage has released the machine, because the cube regeneration needs 4.5-6 GB per cube.
+- **A finished set says so.** When every variant is complete, `run_sensitivities.py` writes `reports/sens/.set_complete`. `run_all.ps1` then exits at start, before any sweep: the task repeats hourly, so otherwise every hour would re-verify the chain and kill any manual run of these scripts. Delete the file to re-run the set. The driver also keeps the runner's exit code and its `[sens]` lines in `runall.log`; under PowerShell 5.1 the polled exit code read back empty and `sens.out` is overwritten at each start.
+
+An adversarial review (4 reviewers, each followed by a verifier) confirmed 19 findings, none refuted. The ones above were fixed, plus six more:
+- the weather builder deleted its memory-mapped buffer while the Dataset still held it, which on Windows fails AFTER the cube is written and would have aborted the chain for an hour;
+- a boundary between two years of the same draw was tapered;
+- `PROVENANCE.json` and the copy-aside of the previous cube were not atomic;
+- `--wdraw` would have overwritten a draw's partition;
+- a stale variant directory moved on OneDrive had no retry;
+- an interrupted baseline check was never re-run.
+
+Left as designed: a change in any fingerprint input still moves complete variants to `_stale/` (moved, never deleted).
+
+Tests: `tests/test_reference_scenario.py` (19).
+
+### Left open
+
+- **The re-run's fidelity is not yet measured.** It needs the machine after the Monte-Carlo; the first number will be `reports/sens/s00_baseline/reference_check.json`. **Measured on 2026-09-18: see the last section.**
+- **The demand variants still frame 700 and 650 TWh against the workbook's stated 745.** With the reference kept at 590 TWh in 2050 by decision (2026-09-14), whether "the 700 TWh cut" is still the question to ask is the user's call. The construction is unchanged. **Answered the same day (next section).**
+- **Golden realization 0** is still to be rebuilt from the default cube and checked after the sensitivity work.
+
+## La porte de la référence : les sensibilités ne partent que si la référence recalculée tombe à 1 €/MWh de la moyenne, chaque année (2026-09-17)
+
+The same day, the user tightened the section above: the baseline's re-run must be MEASURED, and the sensitivities launched only if, for every year, its French annual mean spot lies within 1 EUR/MWh of the mean of draws 0-29. If a year does not, the reference scenario is adjusted before anything else runs. This replaces "the check reports and does not stop the set".
+
+### The gate
+
+`scripts/reference_gate.py`, `TOLERANCE = 1.0` EUR/MWh.
+- The tolerance is a module constant, not an option.
+- A year also fails when its re-run priced a different number of hours than the draw's own run (a dropped window), or when it is missing.
+- The verdict (`reports/sens/s00_baseline/reference_gate.json`) records the baseline's fingerprint, the map meta sha256 and the sha256 of the check it read. It counts only while all three are current and it is newer than the baseline's marker.
+
+`run_sensitivities.py` now works in this order:
+1. Dispatch the baseline alone, its 20 years split across the 3 workers.
+2. Check it (`check_reference_weather.py`, which now also compares hours).
+3. Judge it with the gate.
+4. Only then start the other 19 variants.
+
+A failed gate exits 4 and starts nothing.
+
+### What a re-run can add to a draw's own result (investigation of 2026-09-17, read-only, verified twice)
+
+- **Years are independent.** Year y reads only year-y data from its three inputs. No state, cache or statistic crosses a year. The one exception is the seam taper: the first and last 72 h of y depend on the neighbouring years' draws. Replacing d(y) therefore changes y-1, y and y+1 and nothing else, which is also why the baseline can be split across processes.
+- **The re-run differs from the draw's own run in three ways.**
+  - **The seam taper.** It also spreads over the whole year through the neighbours' annual RES renormalisation (`weather_shapes.py` `mean_fit`).
+  - **Wall-clock solver budgets.** 90 s for a seam solve, 180 s for a cold solve, 300 s per window. A seam solve can fall back to cold silently, and a window can be dropped.
+    - One dropped window moves a year's FR mean by -2.4 to +1.5 EUR/MWh.
+    - Among draws 0-29 exactly one year dropped one: draw 6 in 2032, not a mapped year.
+    - The runner now re-runs any missing or short year up to twice, for the baseline and for every variant (`_short/` keeps the set-aside files).
+  - **An LP permuted per process.** `flexibility/storage.py` builds the storage block by iterating a set of zone names, and Python randomises string hashing per process. `PYTHONHASHSEED` is now pinned to 0 for every run, and `run_reference_20y.py` refuses a run without it. The baseline and all variants then solve one LP ordering, so a variant's delta is not polluted by the permutation.
+- **Margins in the draws' own runs.** Measured against the 30-draw mean, the tightest years are:
+
+  | Year | Draw | Own-run deviation (EUR/MWh) | Headroom |
+  |---|---|---|---|
+  | 2042 | 9 | -0.91 | 0.09 |
+  | 2033 | 4 | +0.86 | 0.14 |
+  | 2041 | 4 | -0.80 | 0.20 |
+  | 2044 | 19 | +0.77 | 0.23 |
+  | 2040 | 29 | +0.71 | 0.29 |
+
+  2033 and 2027 had a single draw within 1 EUR/MWh among draws 0-29.
+
+### When the gate fails: `scripts/adjust_reference_map.py`
+
+A failing year's gap splits into (own - ens), bounded by the selection, and e = (ref - own), added by the re-run. A replacement draw c is predicted to pass when |dev_c| + |e| <= 1, taking the worst case for the unknown sign of its own re-run error. The candidates are tried in three tiers (as revised after the second review, below):
+1. The draws the map was selected on (0-29) that are predicted to pass. Among those that also keep 0.25 EUR/MWh in hand, the one whose neighbours sit closest to their means wins, which is the selection's own second criterion. When none keeps that margin, the one with the most FR headroom wins.
+2. Only with `--allow-other-draws`: the same test over the ensemble's other completed draws (30-49). The driver does not pass the flag: the user asked for a reference built from the 30 draws, and has not approved widening the pool.
+3. Otherwise, the draw predicted closest once the sign of e is taken into account (|dev_c + e|), and only if that prediction improves on the measured gap.
+
+The following are never proposed:
+- a draw already tried for that year;
+- a draw whose own run of that year dropped a window;
+- a draw whose artefacts the chain could not build (weather summary, recorded cube size, driver caches, availability partitions).
+
+A year whose re-run has full hours but whose draw's own run is short is replaced like a failing year: that draw's archived mean is over fewer hours.
+
+The map and meta are rewritten with the previous pair kept in `archive/reference_20y/history/`. The meta's `adjustments` records each change with its measured gap, reproduction error, tier and predicted worst case.
+
+The adjuster refuses, and the set is not launched, in these cases:
+- a stale verdict;
+- a re-run that is itself short, or missing years, which is a solver problem, not a scenario choice;
+- no candidate left;
+- more than 3 rounds.
+
+`build_reference_weather.py` keeps verified cubes between rounds, so a round regenerates only the draws it newly names.
+
+### The driver
+
+`run_all.ps1` stage 2 is a loop of at most 4 passes. Each pass rebuilds the reference (idempotent steps) and runs `run_sensitivities`. On exit 4 the driver runs `adjust_reference_map.py`, then either loops or stops. Exit 5 means the baseline could not be completed or checked, and it stops.
+
+The loop was exercised end to end on a sandbox copy of the driver, with the process sweep neutralised and stub steps, in five scenarios:
+- adjust then pass;
+- rounds exhausted;
+- baseline failed;
+- a chain step failing;
+- a finished set exiting at start.
+
+### The French demand variants are percentage reductions of the 590 TWh reference (user decision)
+
+They were built as "the 700 / 650 TWh cut against the workbook's 745", reached at the last modelled year. The user fixed them as reductions of the 590 TWh reference (2050), reached in full in 2050. The percentages are the proportions of the original request: 700/745 = -6.04 % and 650/745 = -12.75%, giving 554.4 and 514.8 TWh in 2050. The variants are renamed `s09_fr_demand_m6` and `s10a_fr_demand_m13`.
+
+The reduction ramps linearly from nothing in 2027. The earlier form held French growth to a fraction k of the reference's, off a least-squares trend. Anchored at 590 TWh that form would bend: the trend itself reaches 603 TWh in 2050, and 2046 would have been cut by 5.6 % instead of the 5.0 % a 6.0 % cut in 2050 implies.
+
+| | 2035 | 2046 | Horizon energy |
+|---|---|---|---|
+| `s09_fr_demand_m6` | -2.1 % | -5.0 % (542.9 TWh against 571.4) | -2.6 % |
+| `s10a_fr_demand_m13` | -4.4 % | -10.5 % (511.2 TWh) | -5.5 % |
+
+Only the measured years are written to `DISPATCH_DEMAND_SCALE`, so the dispatch never extrapolates the factor.
+
+### Left open
+
+- **The gate has not been measured yet.** It needs the machine after the Monte-Carlo. **Measured on 2026-09-18: passed on the first run (next section).**
+- **Tier 2 of the adjuster reaches beyond "the existing 30 draws".** **Made opt-in (`--allow-other-draws`, not passed by the driver) after the second review (next section).**
+
+Tests: `tests/test_reference_gate.py` (8), and the updated demand test in `tests/test_reference_scenario.py`.
+
+## Mesure : la référence recalculée tombe à moins de 1 €/MWh de la moyenne chaque année, et le jeu de sensibilités est complet (2026-09-18/19)
+
+### The run
+
+- **Friday 18 September.**
+  - 07:01: the ensemble's last draw completed (50/50, `3724001c75e0`).
+  - 08:05: the next driver start ran stage 2.
+  - 08:05-08:39: the reference cube was rebuilt. The 15 draw cubes were regenerated and each matched its draw's recorded byte size and `weather_summary.csv`.
+  - 08:40-10:24: the baseline ran, its 20 years split across 3 processes.
+  - 10:26: the check and the gate ran. The gate **passed on the first run**, so no year of the map had to be re-chosen.
+  - The variants then started. By 19:22 six were complete.
+- **Friday 20:31.** Windows shut down and restarted cleanly (System log events 13 and 12, not a crash). The driver resumed at 21:00 and lost only the years in flight.
+- **Saturday 19 September, 15:11.** The remaining 13 variants completed: 20/20, `.set_complete` written. Since then every hourly start exits at once.
+
+No year of any variant came back short, so no repair pass ran and `_short/` is empty everywhere.
+
+### The baseline gate (France, annual mean spot, re-run against the mean of draws 0-29)
+
+| | Mean abs. | Max abs. | Horizon |
+|---|---|---|---|
+| Re-run minus the ensemble mean (EUR/MWh) | 0.41 | 0.93 (2033) | +0.08 |
+| Re-run minus draw d(y)'s own run (EUR/MWh) | 0.10 | 0.44 (2040) | |
+
+Every year was priced on its full hours (8736; 8640 in 2046). The tightest years were those the own-run margins predicted:
+
+| Year | Gap (EUR/MWh) |
+|---|---|
+| 2033 | +0.93 |
+| 2042 | -0.83 |
+| 2038 | -0.77 |
+| 2044 | +0.68 |
+| 2041 | -0.64 |
+
+The construction reproduces its draws to 0.10 EUR/MWh on average. The re-run error is smaller than the selection's own-run deviations in all but two years (2034, 2040).
+
+The other zones were not gated. Their mean abs(gap) runs from 0.67 (NL) to 3.89 (PL_CZ), with mean abs(z) between 0.37 and 0.66: within one standard deviation of the ensemble spread. PL_CZ is the loosest, reaching 14.6 EUR/MWh in one year. All figures are in `reports/sens/s00_baseline/reference_check.json` and in the "Baseline gate" tab of `archive/sensitivities_consolidated.xlsx`.
+
+### The set: FR annual mean spot, delta against the baseline
+
+The baseline averages 63.05 EUR/MWh over 2027-2046 (82.6 in 2027, 53.0 in 2030, 53.9 in 2035, 64.2 in 2040, 75.3 in 2046).
+
+| Variant | Mean delta | Largest yearly delta |
+|---|---|---|
+| FR nuclear retired at 60 years | +13.66 | +71.75 |
+| FR demand -12.75 % of 590 TWh in 2050 | -11.34 | -24.60 |
+| Non-FR wind +10 % | -7.93 | -10.06 |
+| FR nuclear availability -5 % | +7.47 | +9.18 |
+| Spanish nuclear to 60 years | -7.43 | -13.14 |
+| FR onshore wind -20 % | +5.77 | +7.95 |
+| FR solar -20 % | +5.44 | +6.57 |
+| FR demand -6.04 % of 590 TWh in 2050 | -5.41 | -11.82 |
+| Non-FR solar +10 % | -4.49 | -5.78 |
+| Gas 25 EUR/MWh long-run | -4.42 | -6.74 |
+| CO2 150 EUR/t long-run | -3.40 | -5.01 |
+| FR electrolysis frozen at 2 GW | -3.08 | -5.94 |
+| FR onshore wind -10 % | +2.87 | +3.94 |
+| FR solar -10 % | +2.56 | +3.28 |
+| Gas 30 EUR/MWh long-run | -2.28 | -3.64 |
+| CO2 175 EUR/t long-run | -1.52 | -2.21 |
+| FR nuclear availability -1 % | +1.51 | +1.87 |
+| FR onshore wind +5 % (repowering) | -1.27 | -1.95 |
+| FR-ES interconnection +2000 MW | -0.41 | -2.10 |
+
+### The Monte-Carlo boxplots and the CRE cost of existing nuclear
+
+`scripts/mc_boxplots.py` draws the ensemble's 50 draws year by year, in `reports/mc50/boxplots/`: mean and median spot, nuclear revenue and nuclear capture price. The capture-price chart carries the CRE's full production cost of the existing fleet as red dotted steps.
+
+The user asked for "the cost estimate made by the CRE in 2024". No CRE estimate is dated 2024. The one in force throughout 2024 is the report of September 2023: 60.7 EUR/MWh over 2026-2030, 59.1 over 2031-2035 and 57.3 over 2036-2040, in 2022 euros, with no estimate beyond 2040. Its September 2025 update (60.3 EUR2026/MWh for 2026-2028, 63.4 for 2029-2031) is not drawn.
+
+Against that line, the median capture price across the draws is:
+- below it in 2029 and 2030 (56.0 and 58.5 against 60.7);
+- level with it in 2031;
+- above it from 2032, by 11-21 EUR/MWh from 2036.
+
+### The second adversarial review (2026-09-17), applied on 2026-09-21
+
+Four reviewers each ran with a verifier. They confirmed 23 findings and refuted 2. All code findings are fixed. None concerned a path the weekend actually took.
+
+The fixes below do not change the variant fingerprints. `run_reference_20y.py`, `reference_scenario.py` and the fingerprint formula were left untouched, and a rebuild of the workbooks keeps any whose cells are identical. The 20 finished variants therefore stay complete; this was checked against `.set_complete`.
+
+- **The gate.**
+  - Gaps are compared unrounded, and a NaN gap fails.
+  - The check records its zone and the sha256 of `check_reference_weather.py`, and the verdict records the sha256 of `reference_gate.py`. A verdict from an older checker or gate is no longer current, so the baseline is re-checked.
+  - A check of another zone than FR never passes and is written to `reference_check_<zone>.json`.
+
+  The weekend's verdict was re-established with the current code: passed, same figures.
+- **The runner.**
+  - A partial `--start/--end` into `reports/sens` is refused.
+  - Every line the runner prints is also appended to `reports/sens/sens_history.log`, which no restart truncates.
+  - An exception while a variant moves between stages marks that variant PART instead of ending the runner.
+- **The adjuster.**
+  - Draws 30-49 require `--allow-other-draws`, which is off.
+  - Candidates must be buildable.
+  - Among eligible draws, a margin of 0.25 EUR/MWh is kept before the neighbour score may decide.
+  - The last resort is sign-aware and must improve on the measured gap.
+  - A draw whose own run was short is replaced.
+  - The map and meta are written meta first, with retries, and the old meta is put back if the map cannot follow.
+- **The driver.**
+  - `reports/sens/.stage2_halted.json` stops the hourly retries. An adjuster refusal halts at once. A failed chain step, exit 5 or exit 3 halts at the third failure for the same map. A complete set removes the file.
+  - The lock holds pid and process start time, so a driver started inside an existing PowerShell host is recognised.
+  - All of the runner's `[sens]` lines are copied into `runall.log`.
+
+  All of this was exercised in sandbox copies of the driver, with the sweep neutralised: halt at once, halt after three failures, clear on success, a live holder, and a stale lock.
+- **The workbooks.** `make_sensitivities.py` keeps a rebuilt workbook whose cells equal the one on disk, and retries the file operations OneDrive briefly blocks. A forced rebuild changed none of the 20 workbooks.
+- **The texts.**
+  - The consolidated Notice states a failed or refused verdict as such, lists adjusted years, and computes its demand figures.
+  - The demand figures are corrected: 554.4 TWh, not 555; 2046 is priced 1 January-26 December.
+  - `gate_sensitivities.py` now says the demand paths are probed live.
+
+Tests: `tests/test_reference_gate.py` (13) and `tests/test_reference_scenario.py` (19).
+
+### Left open
+
+- **The scheduled task still runs only while the user is logged on, stops on battery, and has no boot trigger.** A reboot therefore resumes only after a logon; on 18 September it resumed 29 minutes after the reboot. Changing this needs the user's decision, and stored credentials for "run whether logged on or not".
+- **The task is still enabled.** It exits at every hourly start while `.set_complete` exists.
+- **Golden realization 0, `res-model validate` and the full res_model test suite** are still to do.
